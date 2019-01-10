@@ -9,6 +9,7 @@ const SocketProtocolError = scErrors.SocketProtocolError;
 const TimeoutError = scErrors.TimeoutError;
 const InvalidActionError = scErrors.InvalidActionError;
 const AuthError = scErrors.AuthError;
+const SilentMiddlewareBlockedError = scErrors.SilentMiddlewareBlockedError;
 
 function AGServerSocket(id, server, socket) {
   AsyncStreamEmitter.call(this);
@@ -48,6 +49,14 @@ function AGServerSocket(id, server, socket) {
   this.channelSubscriptions = {};
   this.channelSubscriptionsCount = 0;
 
+  this._middleware = {};
+  this._middleware[this.MIDDLEWARE_TRANSMIT] = [];
+  this._middleware[this.MIDDLEWARE_INVOKE] = [];
+  this._middleware[this.MIDDLEWARE_SUBSCRIBE] = [];
+  this._middleware[this.MIDDLEWARE_PUBLISH_IN] = [];
+  this._middleware[this.MIDDLEWARE_PUBLISH_OUT] = [];
+  this._middleware[this.MIDDLEWARE_AUTHENTICATE] = [];
+
   this.socket.on('error', (err) => {
     this.emitError(err);
   });
@@ -81,7 +90,7 @@ function AGServerSocket(id, server, socket) {
     // If pong
     if (obj === '#2') {
       let token = this.getAuthToken();
-      if (this.server.isAuthTokenExpired(token)) {
+      if (this.isAuthTokenExpired(token)) {
         this.deauthenticate();
       }
     } else {
@@ -99,6 +108,13 @@ function AGServerSocket(id, server, socket) {
 
 AGServerSocket.prototype = Object.create(AsyncStreamEmitter.prototype);
 
+AGServerSocket.prototype.MIDDLEWARE_TRANSMIT = AGServerSocket.MIDDLEWARE_TRANSMIT = 'transmit';
+AGServerSocket.prototype.MIDDLEWARE_INVOKE = AGServerSocket.MIDDLEWARE_INVOKE = 'invoke';
+AGServerSocket.prototype.MIDDLEWARE_SUBSCRIBE = AGServerSocket.MIDDLEWARE_SUBSCRIBE = 'subscribe';
+AGServerSocket.prototype.MIDDLEWARE_PUBLISH_IN = AGServerSocket.MIDDLEWARE_PUBLISH_IN = 'publishIn';
+AGServerSocket.prototype.MIDDLEWARE_PUBLISH_OUT = AGServerSocket.MIDDLEWARE_PUBLISH_OUT = 'publishOut';
+AGServerSocket.prototype.MIDDLEWARE_AUTHENTICATE = AGServerSocket.MIDDLEWARE_AUTHENTICATE = 'authenticate';
+
 AGServerSocket.CONNECTING = AGServerSocket.prototype.CONNECTING = 'connecting';
 AGServerSocket.OPEN = AGServerSocket.prototype.OPEN = 'open';
 AGServerSocket.CLOSED = AGServerSocket.prototype.CLOSED = 'closed';
@@ -108,6 +124,22 @@ AGServerSocket.UNAUTHENTICATED = AGServerSocket.prototype.UNAUTHENTICATED = 'una
 
 AGServerSocket.ignoreStatuses = scErrors.socketProtocolIgnoreStatuses;
 AGServerSocket.errorStatuses = scErrors.socketProtocolErrorStatuses;
+
+AGServerSocket.prototype.addMiddleware = function (type, middleware) {
+  if (!this._middleware[type]) {
+    throw new InvalidArgumentsError(`Middleware type "${type}" is not supported on AGServerSocket instance`);
+    // Read more: https://socketcluster.io/#!/docs/middleware-and-authorization
+  }
+  this._middleware[type].push(middleware);
+};
+
+AGServerSocket.prototype.removeMiddleware = function (type, middleware) {
+  let middlewareFunctions = this._middleware[type];
+
+  this._middleware[type] = middlewareFunctions.filter((fn) => {
+    return fn !== middleware;
+  });
+};
 
 AGServerSocket.prototype.receiver = function (receiverName) {
   return this._receiverDemux.stream(receiverName);
@@ -142,7 +174,7 @@ AGServerSocket.prototype._handleRemoteEventObject = function (obj, message) {
     };
 
     if (obj.cid == null) {
-      this.server.verifyInboundRemoteEvent(requestOptions, (err, newEventData) => {
+      this._verifyInboundRemoteEvent(requestOptions, (err, newEventData) => {
         if (!err) {
           this._receiverDemux.write(eventName, newEventData);
         }
@@ -150,7 +182,7 @@ AGServerSocket.prototype._handleRemoteEventObject = function (obj, message) {
     } else {
       requestOptions.cid = obj.cid;
       let response = new Response(this, requestOptions.cid);
-      this.server.verifyInboundRemoteEvent(requestOptions, (err, newEventData, ackData) => {
+      this._verifyInboundRemoteEvent(requestOptions, (err, newEventData, ackData) => {
         if (err) {
           response.error(err);
         } else {
@@ -213,9 +245,7 @@ AGServerSocket.prototype.getBytesReceived = function () {
 };
 
 AGServerSocket.prototype.emitError = function (error) {
-  this.emit('error', {
-    error
-  });
+  this.emit('error', {error});
 };
 
 AGServerSocket.prototype._onClose = function (code, reason) {
@@ -334,9 +364,9 @@ AGServerSocket.prototype.sendObject = function (object, options) {
 };
 
 AGServerSocket.prototype.transmit = function (event, data, options) {
-  this.server.verifyOutboundEvent(this, event, data, options, (err, newData) => {
+  this._verifyOutboundEvent(event, data, options, (err, newData) => {
     let eventObject = {
-      event: event
+      event
     };
     if (newData !== undefined) {
       eventObject.data = newData;
@@ -356,13 +386,13 @@ AGServerSocket.prototype.transmit = function (event, data, options) {
 
 AGServerSocket.prototype.invoke = function (event, data, options) {
   return new Promise((resolve, reject) => {
-    this.server.verifyOutboundEvent(this, event, data, options, (err, newData) => {
+    this._verifyOutboundEvent(event, data, options, (err, newData) => {
       if (err) {
         reject(err);
         return;
       }
       let eventObject = {
-        event: event,
+        event,
         cid: this._nextCallId()
       };
       if (newData !== undefined) {
@@ -574,6 +604,449 @@ AGServerSocket.prototype.subscriptions = function () {
 
 AGServerSocket.prototype.isSubscribed = function (channel) {
   return !!this.channelSubscriptions[channel];
+};
+
+AGServerSocket.prototype._processPublishAction = function (options, request, callback) {
+  let callbackInvoked = false;
+
+  if (this.server.allowClientPublish) {
+    let eventData = options.data || {};
+    request.channel = eventData.channel;
+    request.data = eventData.data;
+
+    async.applyEachSeries(this._middleware[this.MIDDLEWARE_PUBLISH_IN], request,
+      (err) => {
+        if (callbackInvoked) {
+          this.emitError(
+            new InvalidActionError(
+              `Callback for ${this.MIDDLEWARE_PUBLISH_IN} middleware was already invoked`
+            )
+          );
+        } else {
+          callbackInvoked = true;
+          if (request.data !== undefined) {
+            eventData.data = request.data;
+          }
+          if (err) {
+            if (err === true || err.silent) {
+              err = new SilentMiddlewareBlockedError(
+                `Action was silently blocked by ${this.MIDDLEWARE_PUBLISH_IN} middleware`,
+                this.MIDDLEWARE_PUBLISH_IN
+              );
+            } else if (this.server.middlewareEmitWarnings) {
+              this.emitError(err);
+            }
+            callback(err, eventData, request.ackData);
+          } else {
+            if (typeof request.channel !== 'string') {
+              err = new BrokerError(
+                `Socket ${request.socket.id} tried to publish to an invalid ${request.channel} channel`
+              );
+              this.emitError(err);
+              callback(err, eventData, request.ackData);
+              return;
+            }
+            (async () => {
+              let error;
+              try {
+                await this.server.exchange.publish(request.channel, request.data);
+              } catch (err) {
+                error = err;
+                this.emitError(error);
+              }
+              callback(error, eventData, request.ackData);
+            })();
+          }
+        }
+      }
+    );
+  } else {
+    let noPublishError = new InvalidActionError('Client publish feature is disabled');
+    this.emitError(noPublishError);
+    callback(noPublishError);
+  }
+};
+
+AGServerSocket.prototype._processSubscribeAction = function (options, request, callback) {
+  let callbackInvoked = false;
+
+  let eventData = options.data || {};
+  request.channel = eventData.channel;
+  request.waitForAuth = eventData.waitForAuth;
+  request.data = eventData.data;
+
+  if (request.waitForAuth && request.authTokenExpiredError) {
+    // If the channel has the waitForAuth flag set, then we will handle the expiry quietly
+    // and we won't pass this request through the subscribe middleware.
+    callback(request.authTokenExpiredError, eventData);
+  } else {
+    async.applyEachSeries(this._middleware[this.MIDDLEWARE_SUBSCRIBE], request,
+      (err) => {
+        if (callbackInvoked) {
+          this.emitError(
+            new InvalidActionError(
+              `Callback for ${this.MIDDLEWARE_SUBSCRIBE} middleware was already invoked`
+            )
+          );
+        } else {
+          callbackInvoked = true;
+          if (err) {
+            if (err === true || err.silent) {
+              err = new SilentMiddlewareBlockedError(
+                `Action was silently blocked by ${this.MIDDLEWARE_SUBSCRIBE} middleware`,
+                this.MIDDLEWARE_SUBSCRIBE
+              );
+            } else if (this.server.middlewareEmitWarnings) {
+              this.emitError(err);
+            }
+          }
+          if (request.data !== undefined) {
+            eventData.data = request.data;
+          }
+          callback(err, eventData);
+        }
+      }
+    );
+  }
+};
+
+AGServerSocket.prototype._processTransmitAction = function (options, request, callback) {
+  let callbackInvoked = false;
+
+  request.event = options.event;
+  request.data = options.data;
+
+  async.applyEachSeries(this._middleware[this.MIDDLEWARE_TRANSMIT], request,
+    (err) => {
+      if (callbackInvoked) {
+        this.emitError(
+          new InvalidActionError(
+            `Callback for ${this.MIDDLEWARE_TRANSMIT} middleware was already invoked`
+          )
+        );
+      } else {
+        callbackInvoked = true;
+        if (err) {
+          if (err === true || err.silent) {
+            err = new SilentMiddlewareBlockedError(
+              `Action was silently blocked by ${this.MIDDLEWARE_TRANSMIT} middleware`,
+              this.MIDDLEWARE_TRANSMIT
+            );
+          } else if (this.server.middlewareEmitWarnings) {
+            this.emitError(err);
+          }
+        }
+        callback(err, request.data);
+      }
+    }
+  );
+};
+
+AGServerSocket.prototype._processInvokeAction = function (options, request, callback) {
+  let callbackInvoked = false;
+
+  request.event = options.event;
+  request.data = options.data;
+
+  // TODO 2: Remove async module and use for-await-of loop instead
+  async.applyEachSeries(this._middleware[this.MIDDLEWARE_INVOKE], request,
+    (err) => {
+      if (callbackInvoked) {
+        this.emitError(
+          new InvalidActionError(
+            `Callback for ${this.MIDDLEWARE_INVOKE} middleware was already invoked`
+          )
+        );
+      } else {
+        callbackInvoked = true;
+        if (err) {
+          if (err === true || err.silent) {
+            err = new SilentMiddlewareBlockedError(
+              `Action was silently blocked by ${this.MIDDLEWARE_INVOKE} middleware`,
+              this.MIDDLEWARE_INVOKE
+            );
+          } else if (this.server.middlewareEmitWarnings) {
+            this.emitError(err);
+          }
+        }
+        callback(err, request.data);
+      }
+    }
+  );
+};
+
+AGServerSocket.prototype._isReservedRemoteEvent = function (event) {
+  return typeof event === 'string' && event.indexOf('#') === 0;
+};
+
+AGServerSocket.prototype._verifyInboundRemoteEvent = function (requestOptions, callback) {
+  let socket = requestOptions.socket;
+  let token = socket.getAuthToken();
+  if (this.isAuthTokenExpired(token)) {
+    requestOptions.authTokenExpiredError = new AuthTokenExpiredError(
+      'The socket auth token has expired',
+      token.exp
+    );
+
+    socket.deauthenticate();
+  }
+
+  this._passThroughMiddleware(requestOptions, callback);
+};
+
+AGServerSocket.prototype.isAuthTokenExpired = function (token) {
+  if (token && token.exp != null) {
+    let currentTime = Date.now();
+    let expiryMilliseconds = token.exp * 1000;
+    return currentTime > expiryMilliseconds;
+  }
+  return false;
+};
+
+AGServerSocket.prototype._passThroughMiddleware = function (options, callback) {
+  let request = {};
+
+  if (options.authTokenExpiredError != null) {
+    request.authTokenExpiredError = options.authTokenExpiredError;
+  }
+
+  let event = options.event;
+
+  if (options.cid == null) {
+    // If transmit.
+    if (this._isReservedRemoteEvent(event)) {
+      if (event === '#publish') {
+        this._processPublishAction(options, request, callback);
+      } else if (event === '#removeAuthToken') {
+        callback(null, options.data);
+      } else {
+        let error = new InvalidActionError(`The reserved transmitted event ${event} is not supported`);
+        callback(error);
+      }
+    } else {
+      this._processTransmitAction(options, request, callback);
+    }
+  } else {
+    // If invoke/RPC.
+    if (this._isReservedRemoteEvent(event)) {
+      if (event === '#subscribe') {
+        this._processSubscribeAction(options, request, callback);
+      } else if (event === '#publish') {
+        this._processPublishAction(options, request, callback);
+      } else if (
+        event === '#handshake' ||
+        event === '#authenticate' ||
+        event === '#unsubscribe'
+      ) {
+        callback(null, options.data);
+      } else {
+        let error = new InvalidActionError(`The reserved invoked event ${event} is not supported`);
+        callback(error);
+      }
+    } else {
+      this._processInvokeAction(options, request, callback);
+    }
+  }
+};
+
+AGServerSocket.prototype._processTokenError = function (err) {
+  let authError = null;
+  let isBadToken = true;
+
+  if (err) {
+    if (err.name === 'TokenExpiredError') {
+      authError = new AuthTokenExpiredError(err.message, err.expiredAt);
+    } else if (err.name === 'JsonWebTokenError') {
+      authError = new AuthTokenInvalidError(err.message);
+    } else if (err.name === 'NotBeforeError') {
+      authError = new AuthTokenNotBeforeError(err.message, err.date);
+      // In this case, the token is good; it's just not active yet.
+      isBadToken = false;
+    } else {
+      authError = new AuthTokenError(err.message);
+    }
+  }
+
+  return {
+    authError,
+    isBadToken
+  };
+};
+
+AGServerSocket.prototype._emitBadAuthTokenError = function (error, signedAuthToken) {
+  this.emit('badAuthToken', {
+    authError: error,
+    signedAuthToken
+  });
+  this.server.emit('badSocketAuthToken', {
+    socket: this,
+    authError: error,
+    signedAuthToken
+  });
+};
+
+AGServerSocket.prototype._passThroughAuthenticateMiddleware = function (options, callback) {
+  let callbackInvoked = false;
+
+  let request = {
+    authToken: options.authToken
+  };
+
+  // TODO 2: Instantiate this._middleware lines in AGServerSocket constructor
+  async.applyEachSeries(this._middleware[this.MIDDLEWARE_AUTHENTICATE], request,
+    (err, results) => {
+      if (callbackInvoked) {
+        this.emitError(
+          new InvalidActionError(
+            `Callback for ${this.MIDDLEWARE_AUTHENTICATE} middleware was already invoked`
+          )
+        );
+      } else {
+        callbackInvoked = true;
+        let isBadToken = false;
+        if (results.length) {
+          isBadToken = results[results.length - 1] || false;
+        }
+        if (err) {
+          if (err === true || err.silent) {
+            err = new SilentMiddlewareBlockedError(
+              `Action was silently blocked by ${this.MIDDLEWARE_AUTHENTICATE} middleware`,
+              this.MIDDLEWARE_AUTHENTICATE
+            );
+          } else if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+            this.emitError(err);
+          }
+        }
+        callback(err, isBadToken);
+      }
+    }
+  );
+};
+
+AGServerSocket.prototype.processAuthToken = function (signedAuthToken, callback) {
+  let verificationOptions = Object.assign({}, this.server.defaultVerificationOptions);
+
+  let handleVerifyTokenResult = (result) => {
+    let err = result.error;
+    let token = result.token;
+
+    let oldAuthState = this.authState;
+    if (token) {
+      this.signedAuthToken = signedAuthToken;
+      this.authToken = token;
+      this.authState = this.AUTHENTICATED;
+    } else {
+      this.signedAuthToken = null;
+      this.authToken = null;
+      this.authState = this.UNAUTHENTICATED;
+    }
+
+    // If the socket is authenticated, pass it through the MIDDLEWARE_AUTHENTICATE middleware.
+    // If the token is bad, we will tell the client to remove it.
+    // If there is an error but the token is good, then we will send back a 'quiet' error instead
+    // (as part of the status object only).
+    if (this.authToken) {
+      this._passThroughAuthenticateMiddleware({
+        signedAuthToken: this.signedAuthToken,
+        authToken: this.authToken
+      }, (middlewareError, isBadToken) => {
+        if (middlewareError) {
+          this.authToken = null;
+          this.authState = this.UNAUTHENTICATED;
+          if (isBadToken) { // TODO 2: Check if isBadToken functionality is correct <-----------------
+            this._emitBadAuthTokenError(middlewareError, signedAuthToken);
+          }
+        }
+        // If an error is passed back from the authenticate middleware, it will be treated as a
+        // server warning and not a socket error.
+        callback(middlewareError, isBadToken || false, oldAuthState);
+      });
+    } else {
+      let errorData = this._processTokenError(err);
+
+      // If the error is related to the JWT being badly formatted, then we will
+      // treat the error as a socket error.
+      if (err && signedAuthToken != null) {
+        this.emitError(errorData.authError);
+        if (errorData.isBadToken) {
+          this._emitBadAuthTokenError(errorData.authError, signedAuthToken);
+        }
+      }
+      callback(errorData.authError, errorData.isBadToken, oldAuthState);
+    }
+  };
+
+  let verifyTokenResult;
+  let verifyTokenError;
+
+  try {
+    verifyTokenResult = this.server.auth.verifyToken(signedAuthToken, this.verificationKey, verificationOptions);
+  } catch (err) {
+    verifyTokenError = err;
+  }
+
+  if (verifyTokenResult instanceof Promise) {
+    (async () => {
+      let result = {};
+      try {
+        result.token = await verifyTokenResult;
+      } catch (err) {
+        result.error = err;
+      }
+      handleVerifyTokenResult(result);
+    })();
+  } else {
+    let result = {
+      token: verifyTokenResult,
+      error: verifyTokenError
+    };
+    handleVerifyTokenResult(result);
+  }
+};
+
+AGServerSocket.prototype._verifyOutboundEvent = function (eventName, eventData, options, callback) {
+  let callbackInvoked = false;
+
+  if (eventName === '#publish') {
+    let request = {
+      channel: eventData.channel,
+      data: eventData.data
+    };
+    async.applyEachSeries(this._middleware[this.MIDDLEWARE_PUBLISH_OUT], request,
+      (err) => {
+        if (callbackInvoked) {
+          this.emitError(
+            new InvalidActionError(
+              `Callback for ${this.MIDDLEWARE_PUBLISH_OUT} middleware was already invoked`
+            )
+          );
+        } else {
+          callbackInvoked = true;
+          if (request.data !== undefined) {
+            eventData.data = request.data;
+          }
+          if (err) {
+            if (err === true || err.silent) {
+              err = new SilentMiddlewareBlockedError(
+                `Action was silently blocked by ${this.MIDDLEWARE_PUBLISH_OUT} middleware`,
+                this.MIDDLEWARE_PUBLISH_OUT
+              );
+            } else if (this.server.middlewareEmitWarnings) {
+              this.emitError(err);
+            }
+            callback(err, eventData);
+          } else {
+            if (options && request.useCache) {
+              options.useCache = true;
+            }
+            callback(null, eventData);
+          }
+        }
+      }
+    );
+  } else {
+    callback(null, eventData);
+  }
 };
 
 module.exports = AGServerSocket;
