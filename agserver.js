@@ -1,8 +1,8 @@
 const AGServerSocket = require('./agserversocket');
-const AuthEngine = require('sc-auth').AuthEngine;
+const AuthEngine = require('sc-auth');
 const formatter = require('sc-formatter');
 const base64id = require('base64id');
-const async = require('async');
+const async = require('async'); // TODO 2: Remove
 const url = require('url');
 const crypto = require('crypto');
 const uuid = require('uuid');
@@ -10,10 +10,6 @@ const SCSimpleBroker = require('sc-simple-broker').SCSimpleBroker;
 const AsyncStreamEmitter = require('async-stream-emitter');
 
 const scErrors = require('sc-errors');
-const AuthTokenExpiredError = scErrors.AuthTokenExpiredError;
-const AuthTokenInvalidError = scErrors.AuthTokenInvalidError;
-const AuthTokenNotBeforeError = scErrors.AuthTokenNotBeforeError;
-const AuthTokenError = scErrors.AuthTokenError;
 const SilentMiddlewareBlockedError = scErrors.SilentMiddlewareBlockedError;
 const InvalidArgumentsError = scErrors.InvalidArgumentsError;
 const InvalidOptionsError = scErrors.InvalidOptionsError;
@@ -39,8 +35,6 @@ function AGServer(options) {
     appName: uuid.v4(),
     path: '/socketcluster/',
     authDefaultExpiry: 86400,
-    authSignAsync: false,
-    authVerifyAsync: true,
     pubSubBatchDuration: null,
     middlewareEmitWarnings: true
   };
@@ -112,12 +106,7 @@ function AGServer(options) {
     this.verificationKey = opts.authKey;
   }
 
-  this.authVerifyAsync = opts.authVerifyAsync;
-  this.authSignAsync = opts.authSignAsync;
-
-  this.defaultVerificationOptions = {
-    async: this.authVerifyAsync
-  };
+  this.defaultVerificationOptions = {};
   if (opts.authVerifyAlgorithms != null) {
     this.defaultVerificationOptions.algorithms = opts.authVerifyAlgorithms;
   } else if (opts.authAlgorithm != null) {
@@ -125,8 +114,7 @@ function AGServer(options) {
   }
 
   this.defaultSignatureOptions = {
-    expiresIn: opts.authDefaultExpiry,
-    async: this.authSignAsync
+    expiresIn: opts.authDefaultExpiry
   };
   if (opts.authAlgorithm != null) {
     this.defaultSignatureOptions.algorithm = opts.authAlgorithm;
@@ -297,37 +285,38 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
     wsSocket.upgradeReq = upgradeReq;
   }
 
-  let id = this.generateId();
+  let socketId = this.generateId();
 
-  let scSocket = new AGServerSocket(id, this, wsSocket);
+  let scSocket = new AGServerSocket(socketId, this, wsSocket);
   scSocket.exchange = this.exchange;
 
   this._handleSocketErrors(scSocket);
 
-  this.pendingClients[id] = scSocket;
+  this.pendingClients[socketId] = scSocket;
   this.pendingClientsCount++;
 
   let handleSocketAuthenticate = async () => {
     for await (let rpc of scSocket.procedure('#authenticate')) {
       let signedAuthToken = rpc.data;
-
-      scSocket.processAuthToken(signedAuthToken, (err, isBadToken, oldAuthState) => {
-        if (err) {
-          if (isBadToken) {
-            scSocket.deauthenticate();
-          }
-        } else {
-          scSocket.triggerAuthenticationEvents(oldAuthState);
+      let oldAuthState = scSocket.authState;
+      try {
+        await scSocket.processAuthToken(signedAuthToken);
+      } catch (error) {
+        if (error.isBadToken) {
+          scSocket.deauthenticate();
+          rpc.error(error);
+          return;
         }
-        if (err && isBadToken) {
-          rpc.error(err);
-        } else {
-          let authStatus = {
-            isAuthenticated: !!scSocket.authToken,
-            authError: scErrors.dehydrateError(err)
-          };
-          rpc.end(authStatus);
-        }
+        rpc.end({
+          isAuthenticated: !!scSocket.authToken,
+          authError: scErrors.dehydrateError(error)
+        });
+        return;
+      }
+      scSocket.triggerAuthenticationEvents(oldAuthState);
+      rpc.end({
+        isAuthenticated: !!scSocket.authToken,
+        authError: null
       });
     }
   };
@@ -412,16 +401,16 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
     scSocket.closeListener('authStateChange');
     scSocket.closeListener('deauthenticate');
 
-    let isClientFullyConnected = !!this.clients[id];
+    let isClientFullyConnected = !!this.clients[socketId];
 
     if (isClientFullyConnected) {
-      delete this.clients[id];
+      delete this.clients[socketId];
       this.clientsCount--;
     }
 
-    let isClientPending = !!this.pendingClients[id];
+    let isClientPending = !!this.pendingClients[socketId];
     if (isClientPending) {
-      delete this.pendingClients[id];
+      delete this.pendingClients[socketId];
       this.pendingClientsCount--;
     }
 
@@ -467,9 +456,10 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
       let signedAuthToken = data.authToken || null;
       clearTimeout(scSocket._handshakeTimeoutRef);
 
+      // TODO 2: Use async/await for all middlewares
       this._passThroughHandshakeAGMiddleware({
         socket: scSocket
-      }, (err, statusCode) => {
+      }, async (err, statusCode) => {
         if (err) {
           if (err.statusCode == null) {
             err.statusCode = statusCode;
@@ -478,59 +468,60 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
           scSocket.disconnect(err.statusCode);
           return;
         }
-        scSocket.processAuthToken(signedAuthToken, (err, isBadToken, oldAuthState) => {
+
+        let clientSocketStatus = {
+          id: socketId,
+          pingTimeout: this.pingTimeout
+        };
+        let serverSocketStatus = {
+          id: socketId,
+          pingTimeout: this.pingTimeout
+        };
+
+        let oldAuthState = scSocket.authState;
+        try {
+          await scSocket.processAuthToken(signedAuthToken);
           if (scSocket.state === scSocket.CLOSED) {
             return;
           }
+        } catch (error) {
+          if (signedAuthToken != null) {
+            // Because the token is optional as part of the handshake, we don't count
+            // it as an error if the token wasn't provided.
+            clientSocketStatus.authError = scErrors.dehydrateError(error);
+            serverSocketStatus.authError = error;
 
-          let clientSocketStatus = {
-            id: scSocket.id,
-            pingTimeout: this.pingTimeout
-          };
-          let serverSocketStatus = {
-            id: scSocket.id,
-            pingTimeout: this.pingTimeout
-          };
-
-          if (err) {
-            if (signedAuthToken != null) {
-              // Because the token is optional as part of the handshake, we don't count
-              // it as an error if the token wasn't provided.
-              clientSocketStatus.authError = scErrors.dehydrateError(err);
-              serverSocketStatus.authError = err;
-
-              if (isBadToken) {
-                scSocket.deauthenticate();
-              }
+            if (error.isBadToken) {
+              scSocket.deauthenticate();
             }
           }
-          clientSocketStatus.isAuthenticated = !!scSocket.authToken;
-          serverSocketStatus.isAuthenticated = clientSocketStatus.isAuthenticated;
+        }
+        clientSocketStatus.isAuthenticated = !!scSocket.authToken;
+        serverSocketStatus.isAuthenticated = clientSocketStatus.isAuthenticated;
 
-          if (this.pendingClients[id]) {
-            delete this.pendingClients[id];
-            this.pendingClientsCount--;
-          }
-          this.clients[id] = scSocket;
-          this.clientsCount++;
+        if (this.pendingClients[socketId]) {
+          delete this.pendingClients[socketId];
+          this.pendingClientsCount--;
+        }
+        this.clients[socketId] = scSocket;
+        this.clientsCount++;
 
-          scSocket.state = scSocket.OPEN;
+        scSocket.state = scSocket.OPEN;
 
-          if (clientSocketStatus.isAuthenticated) {
-            // Needs to be executed after the connection event to allow
-            // consumers to be setup from inside the connection loop.
-            (async () => {
-              await this.listener('connection').once();
-              scSocket.triggerAuthenticationEvents(oldAuthState);
-            })();
-          }
+        if (clientSocketStatus.isAuthenticated) {
+          // Needs to be executed after the connection event to allow
+          // consumers to be setup from inside the connection loop.
+          (async () => {
+            await this.listener('connection').once();
+            scSocket.triggerAuthenticationEvents(oldAuthState);
+          })();
+        }
 
-          scSocket.emit('connect', serverSocketStatus);
-          this.emit('connection', {socket: scSocket, ...serverSocketStatus});
+        scSocket.emit('connect', serverSocketStatus);
+        this.emit('connection', {socket: scSocket, ...serverSocketStatus});
 
-          // Treat authentication failure as a 'soft' error
-          rpc.end(clientSocketStatus);
-        });
+        // Treat authentication failure as a 'soft' error
+        rpc.end(clientSocketStatus);
       });
     }
   };

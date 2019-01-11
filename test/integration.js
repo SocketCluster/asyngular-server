@@ -154,17 +154,21 @@ describe('Integration tests', function () {
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
+          (async () => {
+            for await (let action of socket.middleware(socket.MIDDLEWARE_INBOUND)) {
+              if (action.type === socket.ACTION_AUTHENTICATE && action.authToken.username === 'alice') {
+                let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
+                err.name = 'AuthenticateMiddlewareError';
+                action.block(err);
+                continue;
+              }
+              action.allow();
+            }
+          })();
+
           connectionHandler(socket);
         }
       })();
-
-      server.addMiddleware(server.MIDDLEWARE_AUTHENTICATE, async function (req) {
-        if (req.authToken.username === 'alice') {
-          let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
-          err.name = 'AuthenticateMiddlewareError';
-          throw err;
-        }
-      });
 
       await server.listener('ready').once();
     });
@@ -320,6 +324,8 @@ describe('Integration tests', function () {
     });
 
     it('Should not authenticate the client if MIDDLEWARE_AUTHENTICATE blocks the authentication', async function () {
+      // TODO 2 TODO 3 TODO 4 Maybe MIDDLEWARE_AUTHENTICATE should be on server because it's hard to catch it otherwise !!!!!
+      // because the action happens before the 'connection' event triggers on the server side; doesn't give enough time to attach middlewares.
       global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenAlice);
 
       client = asyngularClient.create(clientOptions);
@@ -339,8 +345,7 @@ describe('Integration tests', function () {
     it('Token should be available after Promise resolves if token engine signing is synchronous', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authSignAsync: false
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -366,11 +371,10 @@ describe('Integration tests', function () {
       assert.equal(client.authToken.username, 'bob');
     });
 
-    it('If token engine signing is asynchronous, authentication can be captured using the authenticate event', async function () {
+    it('If token engine signing is asynchronous, authentication can be captured using the authenticate event', async function () { // TODO asynchronous title no longer relevant
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authSignAsync: true
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -396,11 +400,10 @@ describe('Integration tests', function () {
       assert.equal(client.authToken.username, 'bob');
     });
 
-    it('Should still work if token verification is asynchronous', async function () {
+    it('Should still work if token verification is asynchronous', async function () { // TODO 2: Title not relevant anymore
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authVerifyAsync: false
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -435,8 +438,7 @@ describe('Integration tests', function () {
     it('Should set the correct expiry when using expiresIn option when creating a JWT with socket.setAuthToken', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authVerifyAsync: false
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -467,8 +469,7 @@ describe('Integration tests', function () {
     it('Should set the correct expiry when adding exp claim when creating a JWT with socket.setAuthToken', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authVerifyAsync: false
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -499,8 +500,7 @@ describe('Integration tests', function () {
     it('The exp claim should have priority over expiresIn option when using socket.setAuthToken', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authVerifyAsync: false
+        wsEngine: WS_ENGINE
       });
 
       (async () => {
@@ -531,8 +531,7 @@ describe('Integration tests', function () {
     it('Should send back error if socket.setAuthToken tries to set both iss claim and issuer option', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authVerifyAsync: false
+        wsEngine: WS_ENGINE
       });
       let warningMap = {};
 
@@ -598,8 +597,7 @@ describe('Integration tests', function () {
     it('Should trigger an authTokenSigned event and socket.signedAuthToken should be set after calling the socket.setAuthToken method', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE,
-        authSignAsync: true
+        wsEngine: WS_ENGINE
       });
 
       let authTokenSignedEventEmitted = false;
@@ -617,7 +615,7 @@ describe('Integration tests', function () {
           (async () => {
             for await (let req of socket.procedure('login')) {
               if (allowedUsers[req.data.username]) {
-                socket.setAuthToken(req.data, {async: true});
+                socket.setAuthToken(req.data);
                 req.end();
               } else {
                 let err = new Error('Failed to login');
@@ -647,7 +645,6 @@ describe('Integration tests', function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE,
-        authSignAsync: true,
         ackTimeout: 1000
       });
 
@@ -697,7 +694,6 @@ describe('Integration tests', function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE,
-        authSignAsync: true,
         ackTimeout: 1000
       });
 

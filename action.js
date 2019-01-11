@@ -4,7 +4,7 @@ const InvalidActionError = scErrors.InvalidActionError;
 function Action(type, data) {
   this.type = type;
   this.data = data;
-  this.processed = false;
+  this.outcome = null;
   this.promise = new Promise((resolve, reject) => {
     this._resolve = resolve;
     this._reject = reject;
@@ -12,18 +12,18 @@ function Action(type, data) {
 }
 
 Action.prototype.allow = function (data) {
-  if (this.processed) {
-    throw new InvalidActionError(`Action ${this.id} has already been processed; cannot allow`);
+  if (this.outcome) {
+    throw new InvalidActionError(`Action ${this.id} has already been ${this.outcome}; cannot allow`);
   }
-  this.processed = true;
+  this.outcome = 'allowed';
   this._resolve(data);
 };
 
 Action.prototype.block = function (error) {
-  if (this.processed) {
-    throw new InvalidActionError(`Action ${this.id} has already been processed; cannot block`);
+  if (this.outcome) {
+    throw new InvalidActionError(`Action ${this.id} has already been ${this.outcome}; cannot block`);
   }
-  this.processed = true;
+  this.outcome = 'blocked';
   this._reject(error);
 };
 
