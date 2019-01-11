@@ -65,10 +65,8 @@ function AGServerSocket(id, server, socket) {
   this.channelSubscriptionsCount = 0;
 
   // TODO 2: Add MIDDLEWARE_INBOUND_RAW for applying middleware on raw messages.
-  this._middlewareInboundStream = new WritableAsyncIterableStream();
-  this._middlewareInboundStream.active = false;
-  this._middlewareOutboundStream = new WritableAsyncIterableStream();
-  this._middlewareOutboundStream.active = false;
+  this._middlewareSocketInboundStream = new WritableAsyncIterableStream();
+  this._middlewareSocketInboundStream = new WritableAsyncIterableStream();
 
   this.socket.on('error', (err) => {
     this.emitError(err);
@@ -121,16 +119,6 @@ function AGServerSocket(id, server, socket) {
 
 AGServerSocket.prototype = Object.create(AsyncStreamEmitter.prototype);
 
-AGServerSocket.prototype.MIDDLEWARE_INBOUND = AGServerSocket.MIDDLEWARE_INBOUND = 'inbound';
-AGServerSocket.prototype.MIDDLEWARE_OUTBOUND = AGServerSocket.MIDDLEWARE_OUTBOUND = 'outbound';
-
-AGServerSocket.prototype.ACTION_TRANSMIT = AGServerSocket.ACTION_TRANSMIT = 'transmit';
-AGServerSocket.prototype.ACTION_INVOKE = AGServerSocket.ACTION_INVOKE = 'invoke';
-AGServerSocket.prototype.ACTION_SUBSCRIBE = AGServerSocket.ACTION_SUBSCRIBE = 'subscribe';
-AGServerSocket.prototype.ACTION_PUBLISH_IN = AGServerSocket.ACTION_PUBLISH_IN = 'publishIn';
-AGServerSocket.prototype.ACTION_PUBLISH_OUT = AGServerSocket.ACTION_PUBLISH_OUT = 'publishOut';
-AGServerSocket.prototype.ACTION_AUTHENTICATE = AGServerSocket.ACTION_AUTHENTICATE = 'authenticate';
-
 AGServerSocket.CONNECTING = AGServerSocket.prototype.CONNECTING = 'connecting';
 AGServerSocket.OPEN = AGServerSocket.prototype.OPEN = 'open';
 AGServerSocket.CLOSED = AGServerSocket.prototype.CLOSED = 'closed';
@@ -140,46 +128,6 @@ AGServerSocket.UNAUTHENTICATED = AGServerSocket.prototype.UNAUTHENTICATED = 'una
 
 AGServerSocket.ignoreStatuses = scErrors.socketProtocolIgnoreStatuses;
 AGServerSocket.errorStatuses = scErrors.socketProtocolErrorStatuses;
-
-AGServerSocket.prototype.middleware = function (type) {
-  if (type === this.MIDDLEWARE_INBOUND) {
-    if (this._middlewareInboundStream.active) {
-      throw new InvalidActionError(
-        `Only one middleware of type "${type}" can be active at any given time`
-      );
-    }
-    this._middlewareInboundStream.active = true;
-    return this._middlewareInboundStream;
-  } else if (type === this.MIDDLEWARE_OUTBOUND) {
-    if (this._middlewareInboundStream.active) {
-      throw new InvalidActionError(
-        `Only one middleware of type "${type}" can be active at any given time`
-      );
-    }
-    this._middlewareOutboundStream.active = true;
-    return this._middlewareOutboundStream;
-  }
-  // Read more: https://socketcluster.io/#!/docs/middleware-and-authorization
-  throw new InvalidArgumentsError(
-    `Middleware type "${type}" is not supported`
-  );
-};
-
-AGServerSocket.prototype.closeMiddleware = function (type) {
-  if (type === this.MIDDLEWARE_INBOUND) {
-    this._middlewareInboundStream.active = false;
-    this._middlewareInboundStream.close();
-    return;
-  } else if (type === this.MIDDLEWARE_OUTBOUND) {
-    this._middlewareOutboundStream.active = false;
-    this._middlewareOutboundStream.close();
-    return;
-  }
-  // Read more: https://socketcluster.io/#!/docs/middleware-and-authorization
-  throw new InvalidArgumentsError(
-    `Middleware type "${type}" is not supported`
-  );
-};
 
 AGServerSocket.prototype.receiver = function (receiverName) {
   return this._receiverDemux.stream(receiverName);
@@ -204,7 +152,7 @@ AGServerSocket.prototype._sendPing = function () {
 };
 
 AGServerSocket.prototype._processMiddlewareAction = async function (middlewareStream, action) {
-  if (!middlewareStream.active) {
+  if (!this.server.hasMiddleware(action.type)) {
     return action.data;
   }
   middlewareStream.write(action);
@@ -245,9 +193,9 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 
     if (isReservedEvent) {
       if (eventName === '#publish') {
-        actionType = this.ACTION_PUBLISH_IN;
+        actionType = this.server.ACTION_PUBLISH_IN;
       } else if (eventName === '#subscribe') {
-        actionType = this.ACTION_SUBSCRIBE;
+        actionType = this.server.ACTION_SUBSCRIBE;
       } else if (
         eventName === '#handshake' ||
         eventName === '#authenticate'
@@ -259,9 +207,9 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
       }
     } else {
       if (isRPC) {
-        actionType = this.ACTION_INVOKE;
+        actionType = this.server.ACTION_INVOKE;
       } else {
-        actionType = this.ACTION_TRANSMIT;
+        actionType = this.server.ACTION_TRANSMIT;
       }
     }
 
@@ -299,7 +247,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 
     if (isRPC) {
       try {
-        newData = await this._processMiddlewareAction(this._middlewareInboundStream, action);
+        newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
       } catch (error) {
         let req = new Request(this, packet.cid, packet.data);
         req.error(error);
@@ -321,7 +269,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     }
 
     try {
-      newData = await this._processMiddlewareAction(this._middlewareInboundStream, action);
+      newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
     } catch (error) {
       return;
     }
@@ -346,9 +294,9 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 };
 
 AGServerSocket.prototype._processOutboundPacket = async function (eventName, eventData) {
-  let action = new Action(this.ACTION_PUBLISH_OUT, eventData);
+  let action = new Action(this.server.ACTION_PUBLISH_OUT, eventData);
 
-  this._middlewareOutboundStream.write(action);
+  this._middlewareSocketInboundStream.write(action);
 
   let newData = await action.promise;
   try {
@@ -793,7 +741,7 @@ AGServerSocket.prototype._emitBadAuthTokenError = function (error, signedAuthTok
   });
 };
 
-AGServerSocket.prototype.processAuthToken = async function (signedAuthToken) {
+AGServerSocket.prototype._processAuthToken = async function (signedAuthToken) {
   let verificationOptions = Object.assign({}, this.server.defaultVerificationOptions);
   let authToken;
 
@@ -821,13 +769,13 @@ AGServerSocket.prototype.processAuthToken = async function (signedAuthToken) {
   this.authToken = authToken;
   this.authState = this.AUTHENTICATED;
 
-  let action = new Action(this.ACTION_AUTHENTICATE, {
+  let action = new Action(this.server.ACTION_AUTHENTICATE, {
     signedAuthToken: this.signedAuthToken,
     authToken: this.authToken
   });
 
   try {
-    await this._processMiddlewareAction(this._middlewareInboundStream, action);
+    await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
   } catch (error) {
     this.authToken = null;
     this.authState = this.UNAUTHENTICATED;

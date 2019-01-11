@@ -152,20 +152,20 @@ describe('Integration tests', function () {
 
       server = asyngularServer.listen(PORT_NUMBER, serverOptions);
 
+      server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, async (middlewareSocketStream) => {
+        for await (let action of middlewareSocketStream) {
+          if (action.type === server.ACTION_AUTHENTICATE && action.authToken.username === 'alice') {
+            let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
+            err.name = 'AuthenticateMiddlewareError';
+            action.block(err);
+            continue;
+          }
+          action.allow();
+        }
+      });
+
       (async () => {
         for await (let {socket} of server.listener('connection')) {
-          (async () => {
-            for await (let action of socket.middleware(socket.MIDDLEWARE_INBOUND)) {
-              if (action.type === socket.ACTION_AUTHENTICATE && action.authToken.username === 'alice') {
-                let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
-                err.name = 'AuthenticateMiddlewareError';
-                action.block(err);
-                continue;
-              }
-              action.allow();
-            }
-          })();
-
           connectionHandler(socket);
         }
       })();

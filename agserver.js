@@ -1,13 +1,14 @@
 const AGServerSocket = require('./agserversocket');
-const AuthEngine = require('sc-auth');
+const AuthEngine = require('ag-auth');
 const formatter = require('sc-formatter');
 const base64id = require('base64id');
-const async = require('async'); // TODO 2: Remove
 const url = require('url');
 const crypto = require('crypto');
 const uuid = require('uuid');
 const SCSimpleBroker = require('sc-simple-broker').SCSimpleBroker;
 const AsyncStreamEmitter = require('async-stream-emitter');
+const WritableAsyncIterableStream = require('writable-async-iterable-stream');
+const Action = require('./action');
 
 const scErrors = require('sc-errors');
 const SilentMiddlewareBlockedError = scErrors.SilentMiddlewareBlockedError;
@@ -42,8 +43,7 @@ function AGServer(options) {
   this.options = Object.assign(opts, options);
 
   this._middleware = {};
-  this._middleware[this.MIDDLEWARE_HANDSHAKE_WS] = [];
-  this._middleware[this.MIDDLEWARE_HANDSHAKE_AG] = [];
+  this._middlewareServerInboundStream = new WritableAsyncIterableStream();
 
   this.origins = opts.origins;
   this._allowAllOrigins = this.origins.indexOf('*:*') !== -1;
@@ -170,8 +170,19 @@ function AGServer(options) {
 
 AGServer.prototype = Object.create(AsyncStreamEmitter.prototype);
 
-AGServer.prototype.MIDDLEWARE_HANDSHAKE_WS = AGServer.MIDDLEWARE_HANDSHAKE_WS = 'handshakeWS';
-AGServer.prototype.MIDDLEWARE_HANDSHAKE_AG = AGServer.MIDDLEWARE_HANDSHAKE_AG = 'handshakeAG';
+AGServer.prototype.MIDDLEWARE_SERVER_INBOUND = AGServer.MIDDLEWARE_SERVER_INBOUND = 'serverInbound';
+AGServer.prototype.MIDDLEWARE_SOCKET_INBOUND = AGServer.MIDDLEWARE_SOCKET_INBOUND = 'socketInbound';
+AGServer.prototype.MIDDLEWARE_SOCKET_OUTBOUND = AGServer.MIDDLEWARE_SOCKET_OUTBOUND = 'socketOutbound';
+
+AGServer.prototype.ACTION_HANDSHAKE_WS = AGServer.ACTION_HANDSHAKE_WS = 'handshakeWS';
+AGServer.prototype.ACTION_HANDSHAKE_AG = AGServer.ACTION_HANDSHAKE_AG = 'handshakeAG';
+
+AGServer.prototype.ACTION_TRANSMIT = AGServer.ACTION_TRANSMIT = 'transmit';
+AGServer.prototype.ACTION_INVOKE = AGServer.ACTION_INVOKE = 'invoke';
+AGServer.prototype.ACTION_SUBSCRIBE = AGServer.ACTION_SUBSCRIBE = 'subscribe';
+AGServer.prototype.ACTION_PUBLISH_IN = AGServer.ACTION_PUBLISH_IN = 'publishIn';
+AGServer.prototype.ACTION_PUBLISH_OUT = AGServer.ACTION_PUBLISH_OUT = 'publishOut';
+AGServer.prototype.ACTION_AUTHENTICATE = AGServer.ACTION_AUTHENTICATE = 'authenticate';
 
 AGServer.prototype.setAuthEngine = function (authEngine) {
   this.auth = authEngine;
@@ -203,8 +214,8 @@ AGServer.prototype._handleSocketErrors = async function (socket) {
   }
 };
 
-AGServer.prototype._handleHandshakeTimeout = function (scSocket) {
-  scSocket.disconnect(4005);
+AGServer.prototype._handleHandshakeTimeout = function (agSocket) {
+  agSocket.disconnect(4005);
 };
 
 AGServer.prototype._subscribeSocket = async function (socket, channelOptions) {
@@ -287,35 +298,45 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
   let socketId = this.generateId();
 
-  let scSocket = new AGServerSocket(socketId, this, wsSocket);
-  scSocket.exchange = this.exchange;
+  let agSocket = new AGServerSocket(socketId, this, wsSocket);
+  agSocket.exchange = this.exchange;
 
-  this._handleSocketErrors(scSocket);
+  this._handleSocketErrors(agSocket);
 
-  this.pendingClients[socketId] = scSocket;
+  let socketInboundMiddleware = this._middleware[this.MIDDLEWARE_SOCKET_INBOUND];
+  if (socketInboundMiddleware) {
+    socketInboundMiddleware(agSocket._middlewareSocketInboundStream); // TODO 2: On disconnect, close all socket middleware streams
+  }
+
+  let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_SOCKET_OUTBOUND];
+  if (socketOutboundMiddleware) {
+    socketOutboundMiddleware(agSocket._middlewareSocketOutboundStream); // TODO 2: On disconnect, close all socket middleware streams
+  }
+
+  this.pendingClients[socketId] = agSocket;
   this.pendingClientsCount++;
 
   let handleSocketAuthenticate = async () => {
-    for await (let rpc of scSocket.procedure('#authenticate')) {
+    for await (let rpc of agSocket.procedure('#authenticate')) {
       let signedAuthToken = rpc.data;
-      let oldAuthState = scSocket.authState;
+      let oldAuthState = agSocket.authState;
       try {
-        await scSocket.processAuthToken(signedAuthToken);
+        await agSocket._processAuthToken(signedAuthToken);
       } catch (error) {
         if (error.isBadToken) {
-          scSocket.deauthenticate();
+          agSocket.deauthenticate();
           rpc.error(error);
           return;
         }
         rpc.end({
-          isAuthenticated: !!scSocket.authToken,
+          isAuthenticated: !!agSocket.authToken,
           authError: scErrors.dehydrateError(error)
         });
         return;
       }
-      scSocket.triggerAuthenticationEvents(oldAuthState);
+      agSocket.triggerAuthenticationEvents(oldAuthState);
       rpc.end({
-        isAuthenticated: !!scSocket.authToken,
+        isAuthenticated: !!agSocket.authToken,
         authError: null
       });
     }
@@ -323,14 +344,14 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
   handleSocketAuthenticate();
 
   let handleSocketRemoveAuthToken = async () => {
-    for await (let data of scSocket.receiver('#removeAuthToken')) {
-      scSocket.deauthenticateSelf();
+    for await (let data of agSocket.receiver('#removeAuthToken')) {
+      agSocket.deauthenticateSelf();
     }
   };
   handleSocketRemoveAuthToken();
 
   let handleSocketSubscribe = async () => {
-    for await (let rpc of scSocket.procedure('#subscribe')) {
+    for await (let rpc of agSocket.procedure('#subscribe')) {
       let channelOptions = rpc.data;
 
       if (!channelOptions) {
@@ -342,13 +363,13 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
       }
 
       (async () => {
-        if (scSocket.state === scSocket.OPEN) {
+        if (agSocket.state === agSocket.OPEN) {
           try {
-            await this._subscribeSocket(scSocket, channelOptions);
+            await this._subscribeSocket(agSocket, channelOptions);
           } catch (err) {
             let error = new BrokerError(`Failed to subscribe socket to the ${channelOptions.channel} channel - ${err}`);
             rpc.error(error);
-            scSocket.emitError(error);
+            agSocket.emitError(error);
             return;
           }
           if (channelOptions.batch) {
@@ -369,11 +390,11 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
   handleSocketSubscribe();
 
   let handleSocketUnsubscribe = async () => {
-    for await (let rpc of scSocket.procedure('#unsubscribe')) {
+    for await (let rpc of agSocket.procedure('#unsubscribe')) {
       let channel = rpc.data;
       let error;
       try {
-        this._unsubscribeSocket(scSocket, channel);
+        this._unsubscribeSocket(agSocket, channel);
       } catch (err) {
         error = new BrokerError(
           `Failed to unsubscribe socket from the ${channel} channel - ${err}`
@@ -381,7 +402,7 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
       }
       if (error) {
         rpc.error(error);
-        scSocket.emitError(error);
+        agSocket.emitError(error);
       } else {
         rpc.end();
       }
@@ -390,16 +411,16 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
   handleSocketUnsubscribe();
 
   let cleanupSocket = (type, code, reason) => {
-    clearTimeout(scSocket._handshakeTimeoutRef);
+    clearTimeout(agSocket._handshakeTimeoutRef);
 
-    scSocket.closeProcedure('#handshake');
-    scSocket.closeProcedure('#authenticate');
-    scSocket.closeProcedure('#subscribe');
-    scSocket.closeProcedure('#unsubscribe');
-    scSocket.closeReceiver('#removeAuthToken');
-    scSocket.closeListener('authenticate');
-    scSocket.closeListener('authStateChange');
-    scSocket.closeListener('deauthenticate');
+    agSocket.closeProcedure('#handshake');
+    agSocket.closeProcedure('#authenticate');
+    agSocket.closeProcedure('#subscribe');
+    agSocket.closeProcedure('#unsubscribe');
+    agSocket.closeReceiver('#removeAuthToken');
+    agSocket.closeListener('authenticate');
+    agSocket.closeListener('authStateChange');
+    agSocket.closeListener('deauthenticate');
 
     let isClientFullyConnected = !!this.clients[socketId];
 
@@ -416,119 +437,122 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
     if (type === 'disconnect') {
       this.emit('disconnection', {
-        socket: scSocket,
+        socket: agSocket,
         code,
         reason
       });
     } else if (type === 'abort') {
       this.emit('connectionAbort', {
-        socket: scSocket,
+        socket: agSocket,
         code,
         reason
       });
     }
     this.emit('closure', {
-      socket: scSocket,
+      socket: agSocket,
       code,
       reason
     });
 
-    this._unsubscribeSocketFromAllChannels(scSocket);
+    this._unsubscribeSocketFromAllChannels(agSocket);
   };
 
   let handleSocketDisconnect = async () => {
-    let event = await scSocket.listener('disconnect').once();
+    let event = await agSocket.listener('disconnect').once();
     cleanupSocket('disconnect', event.code, event.data);
   };
   handleSocketDisconnect();
 
   let handleSocketAbort = async () => {
-    let event = await scSocket.listener('connectAbort').once();
+    let event = await agSocket.listener('connectAbort').once();
     cleanupSocket('abort', event.code, event.data);
   };
   handleSocketAbort();
 
-  scSocket._handshakeTimeoutRef = setTimeout(this._handleHandshakeTimeout.bind(this, scSocket), this.handshakeTimeout);
+  agSocket._handshakeTimeoutRef = setTimeout(this._handleHandshakeTimeout.bind(this, agSocket), this.handshakeTimeout);
 
   let handleSocketHandshake = async () => {
-    for await (let rpc of scSocket.procedure('#handshake')) {
+    for await (let rpc of agSocket.procedure('#handshake')) {
       let data = rpc.data || {};
       let signedAuthToken = data.authToken || null;
-      clearTimeout(scSocket._handshakeTimeoutRef);
+      clearTimeout(agSocket._handshakeTimeoutRef);
 
-      // TODO 2: Use async/await for all middlewares
-      this._passThroughHandshakeAGMiddleware({
-        socket: scSocket
-      }, async (err, statusCode) => {
-        if (err) {
-          if (err.statusCode == null) {
-            err.statusCode = statusCode;
-          }
-          rpc.error(err);
-          scSocket.disconnect(err.statusCode);
+      let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_SERVER_INBOUND];
+      if (serverInboundMiddleware) {
+        serverInboundMiddleware(this._middlewareServerInboundStream);
+      }
+      let action = new Action(this.ACTION_HANDSHAKE_AG, {socket: agSocket});
+
+      try {
+        await this._processMiddlewareAction(this._middlewareServerInboundStream, action);
+      } catch (error) {
+        if (error.statusCode == null) {
+          error.statusCode = statusCode;
+        }
+        rpc.error(error);
+        agSocket.disconnect(error.statusCode);
+        return;
+      }
+
+      let clientSocketStatus = {
+        id: socketId,
+        pingTimeout: this.pingTimeout
+      };
+      let serverSocketStatus = {
+        id: socketId,
+        pingTimeout: this.pingTimeout
+      };
+
+      let oldAuthState = agSocket.authState;
+      try {
+        await agSocket._processAuthToken(signedAuthToken);
+        if (agSocket.state === agSocket.CLOSED) {
           return;
         }
+      } catch (error) {
+        if (signedAuthToken != null) {
+          // Because the token is optional as part of the handshake, we don't count
+          // it as an error if the token wasn't provided.
+          clientSocketStatus.authError = scErrors.dehydrateError(error);
+          serverSocketStatus.authError = error;
 
-        let clientSocketStatus = {
-          id: socketId,
-          pingTimeout: this.pingTimeout
-        };
-        let serverSocketStatus = {
-          id: socketId,
-          pingTimeout: this.pingTimeout
-        };
-
-        let oldAuthState = scSocket.authState;
-        try {
-          await scSocket.processAuthToken(signedAuthToken);
-          if (scSocket.state === scSocket.CLOSED) {
-            return;
-          }
-        } catch (error) {
-          if (signedAuthToken != null) {
-            // Because the token is optional as part of the handshake, we don't count
-            // it as an error if the token wasn't provided.
-            clientSocketStatus.authError = scErrors.dehydrateError(error);
-            serverSocketStatus.authError = error;
-
-            if (error.isBadToken) {
-              scSocket.deauthenticate();
-            }
+          if (error.isBadToken) {
+            agSocket.deauthenticate();
           }
         }
-        clientSocketStatus.isAuthenticated = !!scSocket.authToken;
-        serverSocketStatus.isAuthenticated = clientSocketStatus.isAuthenticated;
+      }
+      clientSocketStatus.isAuthenticated = !!agSocket.authToken;
+      serverSocketStatus.isAuthenticated = clientSocketStatus.isAuthenticated;
 
-        if (this.pendingClients[socketId]) {
-          delete this.pendingClients[socketId];
-          this.pendingClientsCount--;
-        }
-        this.clients[socketId] = scSocket;
-        this.clientsCount++;
+      if (this.pendingClients[socketId]) {
+        delete this.pendingClients[socketId];
+        this.pendingClientsCount--;
+      }
+      this.clients[socketId] = agSocket;
+      this.clientsCount++;
 
-        scSocket.state = scSocket.OPEN;
+      agSocket.state = agSocket.OPEN;
 
-        if (clientSocketStatus.isAuthenticated) {
-          // Needs to be executed after the connection event to allow
-          // consumers to be setup from inside the connection loop.
-          (async () => {
-            await this.listener('connection').once();
-            scSocket.triggerAuthenticationEvents(oldAuthState);
-          })();
-        }
+      if (clientSocketStatus.isAuthenticated) {
+        // Needs to be executed after the connection event to allow
+        // consumers to be setup from inside the connection loop.
+        (async () => {
+          await this.listener('connection').once();
+          agSocket.triggerAuthenticationEvents(oldAuthState);
+        })();
+      }
 
-        scSocket.emit('connect', serverSocketStatus);
-        this.emit('connection', {socket: scSocket, ...serverSocketStatus});
+      agSocket.emit('connect', serverSocketStatus);
+      this.emit('connection', {socket: agSocket, ...serverSocketStatus});
 
-        // Treat authentication failure as a 'soft' error
-        rpc.end(clientSocketStatus);
-      });
+      // Treat authentication failure as a 'soft' error
+      rpc.end(clientSocketStatus);
     }
   };
   handleSocketHandshake();
 
   // Emit event to signal that a socket handshake has been initiated.
-  this.emit('handshake', {socket: scSocket});
+  this.emit('handshake', {socket: agSocket});
 };
 
 AGServer.prototype.close = function () {
@@ -552,23 +576,63 @@ AGServer.prototype.generateId = function () {
   return base64id.generateId();
 };
 
-AGServer.prototype.addMiddleware = function (type, middleware) {
-  if (!this._middleware[type]) {
-    throw new InvalidArgumentsError(`Middleware type "${type}" is not supported on AGServer instance`);
-    // Read more: https://socketcluster.io/#!/docs/middleware-and-authorization
+AGServer.prototype.setMiddleware = function (type, middleware) {
+  if (
+    type !== this.MIDDLEWARE_SERVER_INBOUND &&
+    type !== this.MIDDLEWARE_SOCKET_INBOUND &&
+    type !== this.MIDDLEWARE_SOCKET_OUTBOUND
+  ) {
+    throw new InvalidArgumentsError(
+      `Middleware type "${type}" is not supported`
+    );
   }
-  this._middleware[type].push(middleware);
+  if (this._middleware[type]) {
+    throw new InvalidActionError(`Middleware type "${type}" has already been set`);
+  }
+  this._middleware[type] = middleware;
 };
 
 AGServer.prototype.removeMiddleware = function (type, middleware) {
-  let middlewareFunctions = this._middleware[type];
-
-  this._middleware[type] = middlewareFunctions.filter((fn) => {
-    return fn !== middleware;
-  });
+  delete this._middleware[type];
 };
 
-AGServer.prototype.verifyHandshake = function (info, callback) {
+AGServer.prototype.hasMiddleware = function (type) {
+  return !!this._middleware[type];
+};
+
+AGServer.prototype._processMiddlewareAction = async function (middlewareStream, action) {
+  if (!this.hasMiddleware(action.type)) {
+    return action.data;
+  }
+  middlewareStream.write(action);
+
+  let newData;
+  try {
+    newData = await action.promise;
+  } catch (error) {
+    let clientError;
+    if (error.silent) {
+      clientError = new SilentMiddlewareBlockedError(
+        `Action was blocked by ${action.name} middleware`,
+        action.name
+      );
+    } else {
+      clientError = error;
+    }
+    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+      this.emitWarning(error);
+    }
+    throw clientError;
+  }
+
+  if (newData === undefined) {
+    newData = action.data;
+  }
+
+  return newData;
+};
+
+AGServer.prototype.verifyHandshake = async function (info, callback) {
   let req = info.req;
   let origin = info.origin;
   if (origin === 'null' || origin == null) {
@@ -589,85 +653,26 @@ AGServer.prototype.verifyHandshake = function (info, callback) {
   }
 
   if (ok) {
-    let handshakeMiddleware = this._middleware[this.MIDDLEWARE_HANDSHAKE_WS];
-    if (handshakeMiddleware.length) {
-      let callbackInvoked = false;
-      async.applyEachSeries(handshakeMiddleware, req, (err) => {
-        if (callbackInvoked) {
-          this.emitWarning(
-            new InvalidActionError(
-              `Callback for ${this.MIDDLEWARE_HANDSHAKE_WS} middleware was already invoked`
-            )
-          );
-        } else {
-          callbackInvoked = true;
-          if (err) {
-            if (err === true || err.silent) {
-              err = new SilentMiddlewareBlockedError(
-                `Action was silently blocked by ${this.MIDDLEWARE_HANDSHAKE_WS} middleware`,
-                this.MIDDLEWARE_HANDSHAKE_WS
-              );
-            } else if (this.middlewareEmitWarnings) {
-              this.emitWarning(err);
-            }
-            callback(false, 401, typeof err === 'string' ? err : err.message);
-          } else {
-            callback(true);
-          }
-        }
-      });
-    } else {
-      callback(true);
+    let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_SERVER_INBOUND];
+    if (serverInboundMiddleware) {
+      serverInboundMiddleware(this._middlewareServerInboundStream);
     }
-  } else {
-    let err = new ServerProtocolError(
-      `Failed to authorize socket handshake - Invalid origin: ${origin}`
-    );
-    this.emitWarning(err);
-    callback(false, 403, err.message);
+    let action = new Action(this.ACTION_HANDSHAKE_WS, {request: req});
+
+    try {
+      await this._processMiddlewareAction(this._middlewareServerInboundStream, action);
+    } catch (error) {
+      callback(false, 401, typeof error === 'string' ? error : error.message);
+      return;
+    }
+    callback(true);
+    return;
   }
-};
-
-AGServer.prototype._passThroughHandshakeAGMiddleware = function (options, callback) {
-  let callbackInvoked = false;
-
-  let request = {
-    socket: options.socket
-  };
-
-  async.applyEachSeries(this._middleware[this.MIDDLEWARE_HANDSHAKE_AG], request,
-    (err, results) => {
-      if (callbackInvoked) {
-        this.emitWarning(
-          new InvalidActionError(
-            `Callback for ${this.MIDDLEWARE_HANDSHAKE_AG} middleware was already invoked`
-          )
-        );
-      } else {
-        callbackInvoked = true;
-        let statusCode;
-        if (results.length) {
-          statusCode = results[results.length - 1] || 4008;
-        } else {
-          statusCode = 4008;
-        }
-        if (err) {
-          if (err.statusCode != null) {
-            statusCode = err.statusCode;
-          }
-          if (err === true || err.silent) {
-            err = new SilentMiddlewareBlockedError(
-              `Action was silently blocked by ${this.MIDDLEWARE_HANDSHAKE_AG} middleware`,
-              this.MIDDLEWARE_HANDSHAKE_AG
-            );
-          } else if (this.middlewareEmitWarnings) {
-            this.emitWarning(err);
-          }
-        }
-        callback(err, statusCode);
-      }
-    }
+  let error = new ServerProtocolError(
+    `Failed to authorize socket handshake - Invalid origin: ${origin}`
   );
+  this.emitWarning(error);
+  callback(false, 403, error.message);
 };
 
 module.exports = AGServer;
