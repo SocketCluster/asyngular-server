@@ -1,7 +1,9 @@
 const cloneDeep = require('lodash.clonedeep');
 const StreamDemux = require('stream-demux');
 const AsyncStreamEmitter = require('async-stream-emitter');
-const Response = require('./response').Response;
+// const Response = require('./response'); // TODO 2
+const Action = require('./action');
+const Request = require('./request');
 
 const scErrors = require('sc-errors');
 const InvalidArgumentsError = scErrors.InvalidArgumentsError;
@@ -49,13 +51,9 @@ function AGServerSocket(id, server, socket) {
   this.channelSubscriptions = {};
   this.channelSubscriptionsCount = 0;
 
-  this._middleware = {};
-  this._middleware[this.MIDDLEWARE_TRANSMIT] = [];
-  this._middleware[this.MIDDLEWARE_INVOKE] = [];
-  this._middleware[this.MIDDLEWARE_SUBSCRIBE] = [];
-  this._middleware[this.MIDDLEWARE_PUBLISH_IN] = [];
-  this._middleware[this.MIDDLEWARE_PUBLISH_OUT] = [];
-  this._middleware[this.MIDDLEWARE_AUTHENTICATE] = [];
+  this._middlewareDemux = new StreamDemux();
+  this._middlewareInboundStream = this._middlewareDemux.stream('inbound');
+  this._middlewareOutboundStream = this._middlewareDemux.stream('outbound');
 
   this.socket.on('error', (err) => {
     this.emitError(err);
@@ -76,9 +74,9 @@ function AGServerSocket(id, server, socket) {
 
     this.emit('message', {message});
 
-    let obj;
+    let packet;
     try {
-      obj = this.decode(message);
+      packet = this.decode(message);
     } catch (err) {
       if (err.name === 'Error') {
         err.name = 'InvalidMessageError';
@@ -88,19 +86,19 @@ function AGServerSocket(id, server, socket) {
     }
 
     // If pong
-    if (obj === '#2') {
+    if (packet === '#2') {
       let token = this.getAuthToken();
       if (this.isAuthTokenExpired(token)) {
         this.deauthenticate();
       }
     } else {
-      if (Array.isArray(obj)) {
-        let len = obj.length;
+      if (Array.isArray(packet)) {
+        let len = packet.length;
         for (let i = 0; i < len; i++) {
-          this._handleRemoteEventObject(obj[i], message);
+          this._processInboundPacket(packet[i], message);
         }
       } else {
-        this._handleRemoteEventObject(obj, message);
+        this._processInboundPacket(packet, message);
       }
     }
   });
@@ -125,20 +123,10 @@ AGServerSocket.UNAUTHENTICATED = AGServerSocket.prototype.UNAUTHENTICATED = 'una
 AGServerSocket.ignoreStatuses = scErrors.socketProtocolIgnoreStatuses;
 AGServerSocket.errorStatuses = scErrors.socketProtocolErrorStatuses;
 
-AGServerSocket.prototype.addMiddleware = function (type, middleware) {
-  if (!this._middleware[type]) {
-    throw new InvalidArgumentsError(`Middleware type "${type}" is not supported on AGServerSocket instance`);
-    // Read more: https://socketcluster.io/#!/docs/middleware-and-authorization
-  }
-  this._middleware[type].push(middleware);
-};
-
-AGServerSocket.prototype.removeMiddleware = function (type, middleware) {
-  let middlewareFunctions = this._middleware[type];
-
-  this._middleware[type] = middlewareFunctions.filter((fn) => {
-    return fn !== middleware;
-  });
+AGServerSocket.prototype.middleware = function (type) {
+  // TODO 2: type can be inbound or outbound; throw error if neither.
+  // TODO 2: use _middlewareInboundStream and _middlewareOutboundStream instead.
+  return this._middlewareDemux.stream(type);
 };
 
 AGServerSocket.prototype.receiver = function (receiverName) {
@@ -163,62 +151,140 @@ AGServerSocket.prototype._sendPing = function () {
   }
 };
 
-AGServerSocket.prototype._handleRemoteEventObject = function (obj, message) {
-  if (obj && obj.event != null) {
-    let eventName = obj.event;
+AGServerSocket.prototype._processMiddlewareAction = async function (middlewareStream, action) {
+  middlewareStream.write(action);
 
-    let requestOptions = {
-      socket: this,
-      event: eventName,
-      data: obj.data,
-    };
-
-    if (obj.cid == null) {
-      this._verifyInboundRemoteEvent(requestOptions, (err, newEventData) => {
-        if (!err) {
-          this._receiverDemux.write(eventName, newEventData);
-        }
-      });
+  let newData;
+  try {
+    newData = await action.promise;
+  } catch (error) {
+    let clientError;
+    if (error.silent) {
+      clientError = new SilentMiddlewareBlockedError(
+        `Action was blocked by ${action.name} middleware`,
+        action.name
+      );
     } else {
-      requestOptions.cid = obj.cid;
-      let response = new Response(this, requestOptions.cid);
-      this._verifyInboundRemoteEvent(requestOptions, (err, newEventData, ackData) => {
-        if (err) {
-          response.error(err);
-        } else {
-          if (this._autoAckRPCs[eventName]) {
-            if (ackData !== undefined) {
-              response.end(ackData);
-            } else {
-              response.end();
-            }
-          } else {
-            this._procedureDemux.write(eventName, {
-              data: newEventData,
-              end: (data) => {
-                response.end(data);
-              },
-              error: (err) => {
-                response.error(err);
-              }
-            });
-          }
-        }
-      });
+      clientError = error;
     }
-  } else if (obj && obj.rid != null) {
+    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+      this.emitError(error);
+    }
+    throw clientError;
+  }
+
+  if (newData === undefined) {
+    newData = action.data;
+  }
+
+  return newData;
+};
+
+// TODO 2: AUTHORIZATION MIDDLEWARE check badToken logic
+
+AGServerSocket.prototype._processInboundPacket = async function (packet, message) {
+  if (packet && packet.event != null) {
+    let eventName = packet.event;
+    let actionName;
+    let isRPC = packet.cid != null;
+
+    if (this._isReservedRemoteEvent(eventName)) {
+      if (eventName === '#publish') {
+        actionName = this.MIDDLEWARE_PUBLISH_IN;
+      } else if (eventName === '#subscribe') {
+        actionName = this.MIDDLEWARE_SUBSCRIBE;
+      } else {
+        this.emitError(
+          new InvalidActionError(
+            `The reserved inbound action ${eventName} is not supported`
+          )
+        );
+        return;
+      }
+    } else {
+      if (isRPC) {
+        actionName = this.MIDDLEWARE_INVOKE;
+      } else {
+        actionName = this.MIDDLEWARE_TRANSMIT;
+      }
+    }
+
+    let action = new Action(actionName, packet.data);
+
+    let tokenExpiredError = this._processAuthTokenExpiry();
+    if (tokenExpiredError) {
+      action.authTokenExpiredError = tokenExpiredError;
+    }
+
+    let newData;
+
+    if (isRPC) {
+      try {
+        newData = await this._processMiddlewareAction(this._middlewareInboundStream, action);
+      } catch (error) {
+        let req = new Request(this, packet.cid);
+        req.error(clientError);
+
+        return;
+      }
+
+      let req = new Request(this, packet.cid, newData);
+
+      if (this._autoAckRPCs[eventName]) {
+        if (newData === undefined) {
+          req.end();
+        } else {
+          req.end(newData);
+        }
+      } else {
+        this._procedureDemux.write(eventName, req);
+      }
+
+      return;
+    } else {
+      try {
+        newData = await this._processMiddlewareAction(this._middlewareInboundStream, action);
+      } catch (error) {
+
+        return;
+      }
+    }
+
+    this._receiverDemux.write(eventName, newData);
+
+  } else if (packet && packet.rid != null) {
     // If incoming message is a response to a previously sent message
-    let ret = this._callbackMap[obj.rid];
+    let ret = this._callbackMap[packet.rid];
     if (ret) {
       clearTimeout(ret.timeout);
-      delete this._callbackMap[obj.rid];
-      let rehydratedError = scErrors.hydrateError(obj.error);
-      ret.callback(rehydratedError, obj.data);
+      delete this._callbackMap[packet.rid];
+      let rehydratedError = scErrors.hydrateError(packet.error);
+      ret.callback(rehydratedError, packet.data);
     }
   } else {
     // The last remaining case is to treat the message as raw
     this.emit('raw', {message});
   }
+};
+
+AGServerSocket.prototype._processOutboundPacket = async function (eventName, eventData, options) { // TODO 3
+  let actionName = this.MIDDLEWARE_PUBLISH_OUT;
+  let action = new Action(actionName, eventData);
+
+  this._middlewareOutboundStream.write(action);
+
+  let newData = await action.promise;
+  try {
+  } catch (error) {
+    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+      this.emitError(error);
+    }
+    throw error;
+  }
+  if (newData === undefined) {
+    newData = eventData;
+  }
+  return newData;
 };
 
 AGServerSocket.prototype._resetPongTimeout = function () {
@@ -363,66 +429,65 @@ AGServerSocket.prototype.sendObject = function (object, options) {
   }
 };
 
-AGServerSocket.prototype.transmit = function (event, data, options) {
-  this._verifyOutboundEvent(event, data, options, (err, newData) => {
+AGServerSocket.prototype.transmit = async function (event, data, options) {
+  let newData;
+  if (event === '#publish') {
+    try {
+      newData = await this._processOutboundPacket(event, data, options);
+    } catch (error) {
+      return;
+    }
+  } else {
+    newData = data;
+  }
+
+  if (options && options.useCache && options.stringifiedData != null) {
+    // Optimized
+    this.send(options.stringifiedData);
+  } else {
     let eventObject = {
       event
     };
     if (newData !== undefined) {
       eventObject.data = newData;
     }
-
-    if (!err) {
-      if (options && options.useCache && options.stringifiedData != null) {
-        // Optimized
-        this.send(options.stringifiedData);
-      } else {
-        this.sendObject(eventObject);
-      }
-    }
-  });
-  return Promise.resolve();
+    this.sendObject(eventObject);
+  }
 };
 
 AGServerSocket.prototype.invoke = function (event, data, options) {
   return new Promise((resolve, reject) => {
-    this._verifyOutboundEvent(event, data, options, (err, newData) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      let eventObject = {
-        event,
-        cid: this._nextCallId()
-      };
-      if (newData !== undefined) {
-        eventObject.data = newData;
-      }
+    let eventObject = {
+      event,
+      cid: this._nextCallId()
+    };
+    if (newData !== undefined) {
+      eventObject.data = newData;
+    }
 
-      let timeout = setTimeout(() => {
-        let error = new TimeoutError(`Event response for "${event}" timed out`);
-        delete this._callbackMap[eventObject.cid];
-        reject(error);
-      }, this.server.ackTimeout);
+    let timeout = setTimeout(() => {
+      let error = new TimeoutError(`Event response for "${event}" timed out`);
+      delete this._callbackMap[eventObject.cid];
+      reject(error);
+    }, this.server.ackTimeout);
 
-      this._callbackMap[eventObject.cid] = {
-        callback: (err, result) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-          resolve(result);
-        },
-        timeout: timeout
-      };
+    this._callbackMap[eventObject.cid] = {
+      callback: (err, result) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(result);
+      },
+      timeout
+    };
 
-      if (options && options.useCache && options.stringifiedData != null) {
-        // Optimized
-        this.send(options.stringifiedData);
-      } else {
-        this.sendObject(eventObject);
-      }
-    });
+    if (options && options.useCache && options.stringifiedData != null) {
+      // Optimized
+      this.send(options.stringifiedData);
+    } else {
+      this.sendObject(eventObject);
+    }
   });
 };
 
@@ -613,53 +678,58 @@ AGServerSocket.prototype._processPublishAction = function (options, request, cal
     let eventData = options.data || {};
     request.channel = eventData.channel;
     request.data = eventData.data;
+    request.block = (error) => {
 
-    async.applyEachSeries(this._middleware[this.MIDDLEWARE_PUBLISH_IN], request,
-      (err) => {
-        if (callbackInvoked) {
-          this.emitError(
-            new InvalidActionError(
-              `Callback for ${this.MIDDLEWARE_PUBLISH_IN} middleware was already invoked`
-            )
-          );
-        } else {
-          callbackInvoked = true;
-          if (request.data !== undefined) {
-            eventData.data = request.data;
-          }
-          if (err) {
-            if (err === true || err.silent) {
-              err = new SilentMiddlewareBlockedError(
-                `Action was silently blocked by ${this.MIDDLEWARE_PUBLISH_IN} middleware`,
-                this.MIDDLEWARE_PUBLISH_IN
-              );
-            } else if (this.server.middlewareEmitWarnings) {
-              this.emitError(err);
-            }
-            callback(err, eventData, request.ackData);
-          } else {
-            if (typeof request.channel !== 'string') {
-              err = new BrokerError(
-                `Socket ${request.socket.id} tried to publish to an invalid ${request.channel} channel`
-              );
-              this.emitError(err);
-              callback(err, eventData, request.ackData);
-              return;
-            }
-            (async () => {
-              let error;
-              try {
-                await this.server.exchange.publish(request.channel, request.data);
-              } catch (err) {
-                error = err;
-                this.emitError(error);
-              }
-              callback(error, eventData, request.ackData);
-            })();
-          }
-        }
-      }
-    );
+    };
+
+    this._middlewareInboundStream.write(request);
+    // TODO 2
+    // async.applyEachSeries(this._middleware[this.MIDDLEWARE_PUBLISH_IN], request,
+    //   (err) => {
+    //     if (callbackInvoked) {
+    //       this.emitError(
+    //         new InvalidActionError(
+    //           `Callback for ${this.MIDDLEWARE_PUBLISH_IN} middleware was already invoked`
+    //         )
+    //       );
+    //     } else {
+    //       callbackInvoked = true;
+    //       if (request.data !== undefined) {
+    //         eventData.data = request.data;
+    //       }
+    //       if (err) {
+    //         if (err === true || err.silent) {
+    //           err = new SilentMiddlewareBlockedError(
+    //             `Action was silently blocked by ${this.MIDDLEWARE_PUBLISH_IN} middleware`,
+    //             this.MIDDLEWARE_PUBLISH_IN
+    //           );
+    //         } else if (this.server.middlewareEmitWarnings) {
+    //           this.emitError(err);
+    //         }
+    //         callback(err, eventData, request.ackData);
+    //       } else {
+    //         if (typeof request.channel !== 'string') {
+    //           err = new BrokerError(
+    //             `Socket ${request.socket.id} tried to publish to an invalid ${request.channel} channel`
+    //           );
+    //           this.emitError(err);
+    //           callback(err, eventData, request.ackData);
+    //           return;
+    //         }
+    //         (async () => {
+    //           let error;
+    //           try {
+    //             await this.server.exchange.publish(request.channel, request.data);
+    //           } catch (err) {
+    //             error = err;
+    //             this.emitError(error);
+    //           }
+    //           callback(error, eventData, request.ackData);
+    //         })();
+    //       }
+    //     }
+    //   }
+    // );
   } else {
     let noPublishError = new InvalidActionError('Client publish feature is disabled');
     this.emitError(noPublishError);
@@ -776,19 +846,32 @@ AGServerSocket.prototype._processInvokeAction = function (options, request, call
 };
 
 AGServerSocket.prototype._isReservedRemoteEvent = function (event) {
-  return typeof event === 'string' && event.indexOf('#') === 0;
+  return typeof event === 'string' && event.charAt(0) === '#';
 };
 
-AGServerSocket.prototype._verifyInboundRemoteEvent = function (requestOptions, callback) {
-  let socket = requestOptions.socket;
-  let token = socket.getAuthToken();
+AGServerSocket.prototype._processAuthTokenExpiry = function () {
+  let token = this.getAuthToken();
+  if (this.isAuthTokenExpired(token)) {
+    this.deauthenticate();
+
+    return new AuthTokenExpiredError(
+      'The socket auth token has expired',
+      token.exp
+    );
+  }
+  return null;
+};
+
+// TODO 2: DELETE
+AGServerSocket.prototype._verifyInboundAction = function (action, callback) {
+  let token = this.getAuthToken();
   if (this.isAuthTokenExpired(token)) {
     requestOptions.authTokenExpiredError = new AuthTokenExpiredError(
       'The socket auth token has expired',
       token.exp
     );
 
-    socket.deauthenticate();
+    this.deauthenticate();
   }
 
   this._passThroughMiddleware(requestOptions, callback);
@@ -803,6 +886,7 @@ AGServerSocket.prototype.isAuthTokenExpired = function (token) {
   return false;
 };
 
+// TODO 2 DELETE
 AGServerSocket.prototype._passThroughMiddleware = function (options, callback) {
   let request = {};
 
@@ -892,7 +976,6 @@ AGServerSocket.prototype._passThroughAuthenticateMiddleware = function (options,
     authToken: options.authToken
   };
 
-  // TODO 2: Instantiate this._middleware lines in AGServerSocket constructor
   async.applyEachSeries(this._middleware[this.MIDDLEWARE_AUTHENTICATE], request,
     (err, results) => {
       if (callbackInvoked) {
@@ -923,10 +1006,10 @@ AGServerSocket.prototype._passThroughAuthenticateMiddleware = function (options,
   );
 };
 
-AGServerSocket.prototype.processAuthToken = function (signedAuthToken, callback) {
+AGServerSocket.prototype.processAuthToken = async function (signedAuthToken) {
   let verificationOptions = Object.assign({}, this.server.defaultVerificationOptions);
 
-  let handleVerifyTokenResult = (result) => {
+  let handleVerifyTokenResult = async (result) => {
     let err = result.error;
     let token = result.token;
 
@@ -946,6 +1029,19 @@ AGServerSocket.prototype.processAuthToken = function (signedAuthToken, callback)
     // If there is an error but the token is good, then we will send back a 'quiet' error instead
     // (as part of the status object only).
     if (this.authToken) {
+      let action = new Action(this.MIDDLEWARE_AUTHENTICATE, {
+        signedAuthToken: this.signedAuthToken,
+        authToken: this.authToken
+      });
+
+      try {
+        await this._processMiddlewareAction(this._middlewareInboundStream, action);
+      } catch (error) {
+
+      }
+
+      // TODO 6
+
       this._passThroughAuthenticateMiddleware({
         signedAuthToken: this.signedAuthToken,
         authToken: this.authToken
@@ -1004,7 +1100,7 @@ AGServerSocket.prototype.processAuthToken = function (signedAuthToken, callback)
   }
 };
 
-AGServerSocket.prototype._verifyOutboundEvent = function (eventName, eventData, options, callback) {
+AGServerSocket.prototype._verifyOutboundAction = function (eventName, eventData, options, callback) { // TODO 4
   let callbackInvoked = false;
 
   if (eventName === '#publish') {

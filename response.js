@@ -52,4 +52,4 @@ Response.prototype.callback = function (error, data, options) {
   }
 };
 
-module.exports.Response = Response;
+module.exports = Response;
