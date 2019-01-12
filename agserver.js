@@ -219,8 +219,8 @@ AGServer.prototype._handleHandshakeTimeout = function (agSocket) {
   agSocket.disconnect(4005);
 };
 
-AGServer.prototype._subscribeSocket = async function (socket, channelOptions) {
-  if (!channelOptions) {
+AGServer.prototype._subscribeSocket = async function (socket, channelName, subscriptionOptions) {
+  if (channelName === undefined || !subscriptionOptions) {
     throw new InvalidActionError(`Socket ${socket.id} provided a malformated channel payload`);
   }
 
@@ -229,8 +229,6 @@ AGServer.prototype._subscribeSocket = async function (socket, channelOptions) {
       `Socket ${socket.id} tried to exceed the channel subscription limit of ${this.socketChannelLimit}`
     );
   }
-
-  let channelName = channelOptions.channel;
 
   if (typeof channelName !== 'string') {
     throw new InvalidActionError(`Socket ${socket.id} provided an invalid channel name`);
@@ -253,12 +251,12 @@ AGServer.prototype._subscribeSocket = async function (socket, channelOptions) {
   }
   socket.emit('subscribe', {
     channel: channelName,
-    subscribeOptions: channelOptions
+    subscriptionOptions
   });
   this.emit('subscription', {
     socket,
     channel: channelName,
-    subscribeOptions: channelOptions
+    subscriptionOptions
   });
 };
 
@@ -303,11 +301,6 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
   agSocket.exchange = this.exchange;
 
   this._handleSocketErrors(agSocket);
-
-  let socketInboundMiddleware = this._middleware[this.MIDDLEWARE_INBOUND];
-  if (socketInboundMiddleware) {
-    socketInboundMiddleware(agSocket._middlewareInboundStream); // TODO 2: On disconnect, close all socket middleware streams
-  }
 
   let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_OUTBOUND];
   if (socketOutboundMiddleware) {
@@ -356,28 +349,22 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
   let handleSocketSubscribe = async () => {
     for await (let rpc of agSocket.procedure('#subscribe')) {
-      let channelOptions = rpc.data;
-
-      if (!channelOptions) {
-        channelOptions = {};
-      } else if (typeof channelOptions === 'string') {
-        channelOptions = {
-          channel: channelOptions
-        };
-      }
+      let subscriptionOptions = Object.assign({}, rpc.data);
+      let channelName = subscriptionOptions.channel;
+      delete subscriptionOptions.channel;
 
       (async () => {
         if (agSocket.state === agSocket.OPEN) {
           try {
-            await this._subscribeSocket(agSocket, channelOptions);
+            await this._subscribeSocket(agSocket, channelName, subscriptionOptions);
           } catch (err) {
-            let error = new BrokerError(`Failed to subscribe socket to the ${channelOptions.channel} channel - ${err}`);
+            let error = new BrokerError(`Failed to subscribe socket to the ${channelName} channel - ${err}`);
             rpc.error(error);
             agSocket.emitError(error);
 
             return;
           }
-          if (channelOptions.batch) {
+          if (subscriptionOptions.batch) {
             rpc.end(undefined, {batch: true});
 
             return;
@@ -484,11 +471,9 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
       let signedAuthToken = data.authToken || null;
       clearTimeout(agSocket._handshakeTimeoutRef);
 
-      let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_INBOUND];
-      if (serverInboundMiddleware) {
-        serverInboundMiddleware(agSocket._middlewareInboundStream);
-      }
-      let action = new Action(this.ACTION_HANDSHAKE_AG, {socket: agSocket});
+      let action = new Action();
+      action.type = this.ACTION_HANDSHAKE_AG;
+      action.socket = agSocket;
 
       try {
         await this._processMiddlewareAction(agSocket._middlewareInboundStream, action);
@@ -625,7 +610,7 @@ AGServer.prototype._processMiddlewareAction = async function (middlewareStream, 
     } else {
       clientError = error;
     }
-    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+    if (this.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
       if (socket) {
         socket.emitError(error);
       } else {
@@ -671,7 +656,9 @@ AGServer.prototype.verifyHandshake = async function (info, callback) {
     if (serverInboundMiddleware) {
       serverInboundMiddleware(middlewareInboundStream);
     }
-    let action = new Action(this.ACTION_HANDSHAKE_WS, {request: req});
+    let action = new Action();
+    action.type = this.ACTION_HANDSHAKE_WS;
+    action.request = req;
 
     try {
       await this._processMiddlewareAction(middlewareInboundStream, action);

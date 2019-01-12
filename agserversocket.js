@@ -148,18 +148,22 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
       // Let AGServer handle these events.
       let request = new Request(this, packet.cid, packet.data);
       this._procedureDemux.write(eventName, request);
+
       return;
     }
     if (eventName === '#removeAuthToken') {
       this._receiverDemux.write(eventName, packet.data);
+
       return;
     }
 
     let tokenExpiredError = this._processAuthTokenExpiry();
 
-    let actionType;
+    let action = new Action();
+    action.socket = this;
 
     let isPublish = eventName === '#publish';
+    let isSubscribe = eventName === '#subscribe';
 
     if (isPublish) {
       if (!this.server.allowClientPublish) {
@@ -172,24 +176,40 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
         }
         return;
       }
-      actionType = this.server.ACTION_PUBLISH_IN;
-    } else if (eventName === '#subscribe') {
-      actionType = this.server.ACTION_SUBSCRIBE;
+      action.type = this.server.ACTION_PUBLISH_IN;
+      if (packet.data) {
+        action.channel = packet.data.channel;
+        action.data = packet.data.data;
+      }
+    } else if (isSubscribe) {
+      action.type = this.server.ACTION_SUBSCRIBE;
+      if (packet.data) {
+        action.channel = packet.data.channel;
+        action.data = packet.data.data;
+      }
     } else if (eventName === '#unsubscribe') {
       // Let AGServer handle this event.
       let request = new Request(this, packet.cid, packet.data);
       this._procedureDemux.write(eventName, request);
+
       return;
     } else {
       if (isRPC) {
-        actionType = this.server.ACTION_INVOKE;
+        action.type = this.server.ACTION_INVOKE;
+        action.procedure = packet.event;
+        if (packet.data !== undefined) {
+          action.data = packet.data;
+        }
       } else {
-        actionType = this.server.ACTION_TRANSMIT;
+        action.type = this.server.ACTION_TRANSMIT;
+        action.receiver = packet.event;
+        if (packet.data !== undefined) {
+          action.data = packet.data;
+        }
       }
     }
 
     let newData;
-    let action = new Action(actionType, packet.data);
 
     if (tokenExpiredError) {
       action.authTokenExpiredError = tokenExpiredError;
@@ -204,11 +224,14 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 
         return;
       }
-      request.data = newData;
+
+      if (!isPublish && !isSubscribe) {
+        request.data = newData;
+      }
 
       if (isPublish) {
         try {
-          await this.server.exchange.publish(request.channel, request.data);
+          await this.server.exchange.publish(request.channel, request.data); // TODO 2 TODO 3
         } catch (error) {
           this.emitError(error);
           request.error(error);
@@ -250,25 +273,6 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
   }
   // The last remaining case is to treat the message as raw
   this.emit('raw', {message});
-};
-
-AGServerSocket.prototype._processOutboundPacket = async function (eventName, eventData) {
-  let action = new Action(this.server.ACTION_PUBLISH_OUT, eventData);
-
-  this._middlewareOutboundStream.write(action);
-
-  let newData = await action.promise;
-  try {
-  } catch (error) {
-    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
-      this.emitError(error);
-    }
-    throw error;
-  }
-  if (newData === undefined) {
-    newData = eventData;
-  }
-  return newData;
 };
 
 AGServerSocket.prototype._resetPongTimeout = function () {
@@ -415,14 +419,24 @@ AGServerSocket.prototype.sendObject = function (object, options) {
 
 AGServerSocket.prototype.transmit = async function (event, data, options) {
   let newData;
+  let packet = {event, data};
   if (event === '#publish') {
+    let action = new Action();
+    action.type = this.server.ACTION_PUBLISH_OUT;
+    action.socket = this;
+
+    if (data !== undefined) {
+      action.channel = data.channel;
+      action.data = data.data;
+    }
     try {
-      newData = await this._processOutboundPacket(event, data);
+      newData = await this.server._processMiddlewareAction(this._middlewareOutboundStream, action, this);
     } catch (error) {
+
       return;
     }
   } else {
-    newData = data;
+    newData = packet.data;
   }
 
   if (options && options.useCache && options.stringifiedData != null) {
@@ -430,7 +444,7 @@ AGServerSocket.prototype.transmit = async function (event, data, options) {
     this.send(options.stringifiedData);
   } else {
     let eventObject = {
-      event
+      event: event
     };
     if (newData !== undefined) {
       eventObject.data = newData;
@@ -697,7 +711,9 @@ AGServerSocket.prototype._emitBadAuthTokenError = function (error, signedAuthTok
 };
 
 AGServerSocket.prototype._processAuthToken = async function (signedAuthToken) {
-  let verificationOptions = Object.assign({}, this.server.defaultVerificationOptions);
+  let verificationOptions = Object.assign({}, this.server.defaultVerificationOptions, {
+    socket: this
+  });
   let authToken;
 
   try {
@@ -724,10 +740,11 @@ AGServerSocket.prototype._processAuthToken = async function (signedAuthToken) {
   this.authToken = authToken;
   this.authState = this.AUTHENTICATED;
 
-  let action = new Action(this.server.ACTION_AUTHENTICATE, {
-    signedAuthToken: this.signedAuthToken,
-    authToken: this.authToken
-  });
+  let action = new Action();
+  action.type = this.server.ACTION_AUTHENTICATE;
+  action.socket = this;
+  action.signedAuthToken = this.signedAuthToken;
+  action.authToken = this.authToken;
 
   try {
     await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);

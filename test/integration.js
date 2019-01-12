@@ -42,7 +42,7 @@ async function resolveAfterTimeout(duration, value) {
 function connectionHandler(socket) {
   (async () => {
     for await (let rpc of socket.procedure('login')) {
-      if (allowedUsers[rpc.data.username]) {
+      if (rpc.data && allowedUsers[rpc.data.username]) {
         socket.setAuthToken(rpc.data);
         rpc.end();
       } else {
@@ -153,8 +153,10 @@ describe('Integration tests', function () {
       server = asyngularServer.listen(PORT_NUMBER, serverOptions);
       server.setMiddleware(server.MIDDLEWARE_INBOUND, async (middlewareStream) => {
         for await (let action of middlewareStream) {
-          console.log('TODO 2 MIDDLEWARE ACTION for-await-of **************', action.type); // -------------
-          if (action.type === server.ACTION_AUTHENTICATE && action.authToken.username === 'alice') { // TODO 2: WHat do to about properties of action object??
+          if (
+            action.type === server.ACTION_AUTHENTICATE &&
+            (!action.authToken || action.authToken.username === 'alice')
+          ) {
             let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
             err.name = 'AuthenticateMiddlewareError';
             action.block(err);
@@ -1328,14 +1330,14 @@ describe('Integration tests', function () {
 
       let channelList = [];
       for (let i = 0; i < 20; i++) {
-        let subscribeOptions = {
+        let subscriptionOptions = {
           batch: true
         };
         if (i === 10) {
-          subscribeOptions.data = {foo: 123};
+          subscriptionOptions.data = {foo: 123};
         }
         channelList.push(
-          client.subscribe('my-channel-' + i, subscribeOptions)
+          client.subscribe('my-channel-' + i, subscriptionOptions)
         );
       }
 
@@ -1353,7 +1355,8 @@ describe('Integration tests', function () {
       })();
 
       (async () => {
-        for await (let event of channelList[0].listener('subscribe')) {
+        for await (let event of channelList[19].listener('subscribe')) {
+          console.log('TODO 3333', 3333333, data); // -----------------------------------
           client.publish('my-channel-19', 'Hello!');
         }
       })();
@@ -2044,11 +2047,11 @@ describe('Integration tests', function () {
     describe('MIDDLEWARE_AUTHENTICATE', function () {
       it('Should not run authenticate middleware if JWT token does not exist', async function () {
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_AUTHENTICATE) {
+          for await (let {type, allow} of middlewareStream) {
+            if (type === server.ACTION_AUTHENTICATE) {
               middlewareWasExecuted = true;
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
@@ -2066,11 +2069,11 @@ describe('Integration tests', function () {
         global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenBob);
 
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_AUTHENTICATE) {
+          for await (let {type, allow} of middlewareStream) {
+            if (type === server.ACTION_AUTHENTICATE) {
               middlewareWasExecuted = true;
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
@@ -2099,16 +2102,16 @@ describe('Integration tests', function () {
         let abortStatus;
 
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_HANDSHAKE_AG) {
+          for await (let {type, allow, block} of middlewareStream) {
+            if (type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
               let err = new Error('AG handshake failed because the server was too lazy');
               err.name = 'TooLazyHandshakeError';
-              action.block(err);
+              block(err);
               continue;
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
@@ -2152,16 +2155,16 @@ describe('Integration tests', function () {
         let abortReason;
 
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_HANDSHAKE_AG) {
+          for await (let {type, allow, block} of middlewareStream) {
+            if (type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
               let err = new Error('AG handshake failed because the server was too lazy');
               err.name = 'TooLazyHandshakeError';
-              action.block(err);
+              block(err);
               continue;
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
@@ -2189,8 +2192,8 @@ describe('Integration tests', function () {
         let abortReason;
 
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_HANDSHAKE_AG) {
+          for await (let {type, allow, block} of middlewareStream) {
+            if (type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
               let err = new Error('AG handshake failed because of invalid query auth parameters');
@@ -2199,10 +2202,10 @@ describe('Integration tests', function () {
               // We will treat this code as a fatal authentication failure on the front end.
               // A status code of 4500 or higher means that the client shouldn't try to reconnect.
               err.statusCode = 4501;
-              action.block(err);
+              block(err);
               continue;
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
@@ -2231,11 +2234,11 @@ describe('Integration tests', function () {
         let abortReason;
 
         middlewareFunction = async function (middlewareStream) {
-          for await (let action of middlewareStream) {
-            if (action.type === server.ACTION_HANDSHAKE_AG) {
+          for await (let {type, allow} of middlewareStream) {
+            if (type === server.ACTION_HANDSHAKE_AG) {
               await wait(500);
             }
-            action.allow();
+            allow();
           }
         };
         server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
