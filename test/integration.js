@@ -1303,19 +1303,24 @@ describe('Integration tests', function () {
 
       // Each subscription should pass through the middleware individually, even
       // though they were sent as a batch/array.
-      server.addMiddleware(server.MIDDLEWARE_SUBSCRIBE, function (req, next) {
-        subscribeMiddlewareCounter++;
-        assert.equal(req.channel.indexOf('my-channel-'), 0);
-        if (req.channel === 'my-channel-10') {
-          assert.equal(JSON.stringify(req.data), JSON.stringify({foo: 123}));
-        } else if (req.channel === 'my-channel-12') {
-          // Block my-channel-12
-          let err = new Error('You cannot subscribe to channel 12');
-          err.name = 'UnauthorizedSubscribeError';
-          next(err);
-          return;
+      server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, async function (middlewareSocketStream) {
+        for await (let action of middlewareSocketStream) {
+          console.log('TODO 2 &&&&&&', action);
+          // if (action.type === server.ACTION_SUBSCRIBE) {
+          //   subscribeMiddlewareCounter++;
+          //   assert.equal(action.channel.indexOf('my-channel-'), 0);
+          //   if (action.channel === 'my-channel-10') {
+          //     assert.equal(JSON.stringify(action.data), JSON.stringify({foo: 123}));
+          //   } else if (action.channel === 'my-channel-12') {
+          //     // Block my-channel-12
+          //     let err = new Error('You cannot subscribe to channel 12');
+          //     err.name = 'UnauthorizedSubscribeError';
+          //     action.block(err);
+          //     continue;
+          //   }
+          // }
+          action.allow();
         }
-        next();
       });
 
       await server.listener('ready').once();
@@ -2042,10 +2047,15 @@ describe('Integration tests', function () {
 
     describe('MIDDLEWARE_AUTHENTICATE', function () {
       it('Should not run authenticate middleware if JWT token does not exist', async function () {
-        middlewareFunction = async function (req) {
-          middlewareWasExecuted = true;
+        middlewareFunction = async function (middlewareSocketStream) {
+          for await (let action of middlewareSocketStream) {
+            if (action.type === server.ACTION_AUTHENTICATE) {
+              middlewareWasExecuted = true;
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_AUTHENTICATE, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2059,10 +2069,15 @@ describe('Integration tests', function () {
       it('Should run authenticate middleware if JWT token exists', async function () {
         global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenBob);
 
-        middlewareFunction = async function (req) {
-          middlewareWasExecuted = true;
+        middlewareFunction = async function (middlewareSocketStream) {
+          for await (let action of middlewareSocketStream) {
+            if (action.type === server.ACTION_AUTHENTICATE) {
+              middlewareWasExecuted = true;
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_AUTHENTICATE, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2080,21 +2095,27 @@ describe('Integration tests', function () {
       });
     });
 
-    describe('MIDDLEWARE_HANDSHAKE_AG', function () {
+    describe('MIDDLEWARE_HANDSHAKE_AG', function () { // TODO 2: Rename to ACTION_
       it('Should trigger correct events if MIDDLEWARE_HANDSHAKE_AG blocks with an error', async function () {
         let middlewareWasExecuted = false;
         let serverWarnings = [];
         let clientErrors = [];
         let abortStatus;
 
-        middlewareFunction = async function (req) {
-          await wait(100);
-          middlewareWasExecuted = true;
-          let err = new Error('AG handshake failed because the server was too lazy');
-          err.name = 'TooLazyHandshakeError';
-          throw err;
+        middlewareFunction = async function (middlewareServerStream) {
+          for await (let action of middlewareServerStream) {
+            if (action.type === server.ACTION_HANDSHAKE_AG) {
+              await wait(100);
+              middlewareWasExecuted = true;
+              let err = new Error('AG handshake failed because the server was too lazy');
+              err.name = 'TooLazyHandshakeError';
+              action.block(err);
+              continue;
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_HANDSHAKE_AG, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
 
         (async () => {
           for await (let {warning} of server.listener('warning')) {
@@ -2134,14 +2155,20 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (req) {
-          await wait(100);
-          middlewareWasExecuted = true;
-          let err = new Error('AG handshake failed because the server was too lazy');
-          err.name = 'TooLazyHandshakeError';
-          throw err;
+        middlewareFunction = async function (middlewareServerStream) {
+          for await (let action of middlewareServerStream) {
+            if (action.type === server.ACTION_HANDSHAKE_AG) {
+              await wait(100);
+              middlewareWasExecuted = true;
+              let err = new Error('AG handshake failed because the server was too lazy');
+              err.name = 'TooLazyHandshakeError';
+              action.block(err);
+              continue;
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_HANDSHAKE_AG, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2165,18 +2192,24 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (req) {
-          await wait(100);
-          middlewareWasExecuted = true;
-          let err = new Error('AG handshake failed because of invalid query auth parameters');
-          err.name = 'InvalidAuthQueryHandshakeError';
-          // Set custom 4501 status code as a property of the error.
-          // We will treat this code as a fatal authentication failure on the front end.
-          // A status code of 4500 or higher means that the client shouldn't try to reconnect.
-          err.statusCode = 4501;
-          throw err;
+        middlewareFunction = async function (middlewareServerStream) {
+          for await (let action of middlewareServerStream) {
+            if (action.type === server.ACTION_HANDSHAKE_AG) {
+              await wait(100);
+              middlewareWasExecuted = true;
+              let err = new Error('AG handshake failed because of invalid query auth parameters');
+              err.name = 'InvalidAuthQueryHandshakeError';
+              // Set custom 4501 status code as a property of the error.
+              // We will treat this code as a fatal authentication failure on the front end.
+              // A status code of 4500 or higher means that the client shouldn't try to reconnect.
+              err.statusCode = 4501;
+              action.block(err);
+              continue;
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_HANDSHAKE_AG, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2201,10 +2234,15 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (req) {
-          await wait(500);
+        middlewareFunction = async function (middlewareServerStream) {
+          for await (let action of middlewareServerStream) {
+            if (action.type === server.ACTION_HANDSHAKE_AG) {
+              await wait(500);
+            }
+            action.allow();
+          }
         };
-        server.addMiddleware(server.MIDDLEWARE_HANDSHAKE_AG, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
 
         createConnectionTime = Date.now();
         client = asyngularClient.create({

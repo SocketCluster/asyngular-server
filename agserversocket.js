@@ -20,19 +20,6 @@ const SilentMiddlewareBlockedError = scErrors.SilentMiddlewareBlockedError;
 function AGServerSocket(id, server, socket) {
   AsyncStreamEmitter.call(this);
 
-  this._reservedRemoteEvents = {
-    '#handshake': true,
-    '#authenticate': true,
-    '#publish': true,
-    '#subscribe': true,
-    '#unsubscribe': true,
-    '#setAuthToken': true,
-    '#removeAuthToken': true
-  };
-  this._autoAckRPCs = {
-    '#publish': true
-  };
-
   this.id = id;
   this.server = server;
   this.socket = socket;
@@ -187,24 +174,43 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
   if (packet && packet.event != null) {
     let eventName = packet.event;
     let isRPC = packet.cid != null;
+
+    if (eventName === '#handshake' || eventName === '#authenticate') {
+      // Let AGServer handle these events.
+      let request = new Request(this, packet.cid, packet.data);
+      this._procedureDemux.write(eventName, request);
+      return;
+    }
+    if (eventName === '#removeAuthToken') {
+      this._receiverDemux.write(eventName, packet.data);
+      return;
+    }
+
+    let tokenExpiredError = this._processAuthTokenExpiry();
+
     let actionType;
 
-    let isReservedEvent = this._isReservedRemoteEvent(eventName);
+    let isPublish = eventName === '#publish';
 
-    if (isReservedEvent) {
-      if (eventName === '#publish') {
-        actionType = this.server.ACTION_PUBLISH_IN;
-      } else if (eventName === '#subscribe') {
-        actionType = this.server.ACTION_SUBSCRIBE;
-      } else if (
-        eventName === '#handshake' ||
-        eventName === '#authenticate'
-      ) {
-        // Let AGServer handle this event.
-        let req = new Request(this, packet.cid, packet.data);
-        this._procedureDemux.write(eventName, req);
+    if (isPublish) {
+      if (!this.server.allowClientPublish) {
+        let error = new InvalidActionError('Client publish feature is disabled');
+        this.emitError(error);
+
+        if (isRPC) {
+          let request = new Request(this, packet.cid, packet.data);
+          request.error(error);
+        }
         return;
       }
+      actionType = this.server.ACTION_PUBLISH_IN;
+    } else if (eventName === '#subscribe') {
+      actionType = this.server.ACTION_SUBSCRIBE;
+    } else if (eventName === '#unsubscribe') {
+      // Let AGServer handle this event.
+      let request = new Request(this, packet.cid, packet.data);
+      this._procedureDemux.write(eventName, request);
+      return;
     } else {
       if (isRPC) {
         actionType = this.server.ACTION_INVOKE;
@@ -213,68 +219,52 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
       }
     }
 
+    let newData;
     let action = new Action(actionType, packet.data);
 
-    let tokenExpiredError = this._processAuthTokenExpiry();
     if (tokenExpiredError) {
       action.authTokenExpiredError = tokenExpiredError;
     }
 
-    if (isReservedEvent) {
-      if (eventName === '#publish' && !this.server.allowClientPublish) {
-        let error = new InvalidActionError('Client publish feature is disabled');
-        this.emitError(error);
-
-        if (isRPC) {
-          let req = new Request(this, packet.cid, packet.data);
-          req.error(error);
-        }
-        return;
-
-      } else if (eventName === '#unsubscribe' || eventName === '#removeAuthToken') {
-        // Let AGServer handle this event.
-        if (isRPC) {
-          let req = new Request(this, packet.cid, packet.data);
-          this._procedureDemux.write(eventName, req);
-        } else {
-          this._receiverDemux.write(eventName, packet.data);
-        }
-        return;
-      }
-    }
-
-    let newData;
-
     if (isRPC) {
+      let request = new Request(this, packet.cid, packet.data);
       try {
         newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
       } catch (error) {
-        let req = new Request(this, packet.cid, packet.data);
-        req.error(error);
+        request.error(error);
+
+        return;
+      }
+      request.data = newData;
+
+      if (isPublish) {
+        try {
+          await this.server.exchange.publish(request.channel, request.data);
+        } catch (error) {
+          this.emitError(error);
+          request.error(error);
+
+          return;
+        }
+        request.end();
+
         return;
       }
 
-      let req = new Request(this, packet.cid, newData);
+      this._procedureDemux.write(eventName, request);
 
-      if (this._autoAckRPCs[eventName]) {
-        if (newData === undefined) {
-          req.end();
-        } else {
-          req.end(newData);
-        }
-      } else {
-        this._procedureDemux.write(eventName, req);
-      }
       return;
     }
 
     try {
       newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
     } catch (error) {
+
       return;
     }
 
     this._receiverDemux.write(eventName, newData);
+
     return;
   }
 
@@ -676,10 +666,6 @@ AGServerSocket.prototype.subscriptions = function () {
 
 AGServerSocket.prototype.isSubscribed = function (channel) {
   return !!this.channelSubscriptions[channel];
-};
-
-AGServerSocket.prototype._isReservedRemoteEvent = function (eventName) {
-  return this._reservedRemoteEvents[eventName] || false;
 };
 
 AGServerSocket.prototype._processAuthTokenExpiry = function () {
