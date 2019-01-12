@@ -2,7 +2,7 @@ const assert = require('assert');
 const asyngularServer = require('../');
 const asyngularClient = require('asyngular-client');
 const localStorage = require('localStorage');
-const SCSimpleBroker = require('sc-simple-broker').SCSimpleBroker;
+const AGSimpleBroker = require('ag-simple-broker');
 
 // Add to the global scope like in browser.
 global.localStorage = localStorage;
@@ -1521,7 +1521,7 @@ describe('Integration tests', function () {
       assert.notEqual(nullPublishError, null);
     });
 
-    it('When default SCSimpleBroker broker engine is used, disconnect event should trigger before unsubscribe event', async function () {
+    it('When default AGSimpleBroker broker engine is used, disconnect event should trigger before unsubscribe event', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -1566,7 +1566,7 @@ describe('Integration tests', function () {
       assert.equal(eventList[1].channel, 'foo');
     });
 
-    it('When default SCSimpleBroker broker engine is used, agServer.exchange should support consuming data from a channel', async function () {
+    it('When default AGSimpleBroker broker engine is used, agServer.exchange should support consuming data from a channel', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -1614,7 +1614,7 @@ describe('Integration tests', function () {
       assert.equal(receivedChannelData[1], 'hi2');
     });
 
-    it('When default SCSimpleBroker broker engine is used, agServer.exchange should support publishing data to a channel', async function () {
+    it('When default AGSimpleBroker broker engine is used, agServer.exchange should support publishing data to a channel', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -1659,7 +1659,7 @@ describe('Integration tests', function () {
     });
 
     it('When disconnecting a socket, the unsubscribe event should trigger after the disconnect event', async function () {
-      let customBrokerEngine = new SCSimpleBroker();
+      let customBrokerEngine = new AGSimpleBroker();
       let defaultUnsubscribeSocket = customBrokerEngine.unsubscribeSocket;
       customBrokerEngine.unsubscribeSocket = function (socket, channel) {
         return resolveAfterTimeout(100, defaultUnsubscribeSocket.call(this, socket, channel));
@@ -1753,7 +1753,7 @@ describe('Integration tests', function () {
     });
 
     it('Socket should not receive messages from a channel which it has only just unsubscribed from (accounting for delayed unsubscribe by brokerEngine)', async function () {
-      let customBrokerEngine = new SCSimpleBroker();
+      let customBrokerEngine = new AGSimpleBroker();
       let defaultUnsubscribeSocket = customBrokerEngine.unsubscribeSocket;
       customBrokerEngine.unsubscribeSocket = function (socket, channel) {
         return resolveAfterTimeout(300, defaultUnsubscribeSocket.call(this, socket, channel));

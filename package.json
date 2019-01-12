@@ -14,7 +14,7 @@
     "ag-auth": "^1.0.0",
     "sc-errors": "^2.0.0",
     "sc-formatter": "^3.0.2",
-    "sc-simple-broker": "^3.2.2",
+    "ag-simple-broker": "^1.0.2",
     "stream-demux": "^4.0.4",
     "uuid": "3.2.1",
     "writable-async-iterable-stream": "^4.0.1",

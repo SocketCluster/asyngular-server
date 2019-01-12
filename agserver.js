@@ -5,7 +5,7 @@ const base64id = require('base64id');
 const url = require('url');
 const crypto = require('crypto');
 const uuid = require('uuid');
-const SCSimpleBroker = require('sc-simple-broker').SCSimpleBroker;
+const AGSimpleBroker = require('ag-simple-broker');
 const AsyncStreamEmitter = require('async-stream-emitter');
 const WritableAsyncIterableStream = require('writable-async-iterable-stream');
 const Action = require('./action');
@@ -22,7 +22,7 @@ function AGServer(options) {
   AsyncStreamEmitter.call(this);
 
   let opts = {
-    brokerEngine: new SCSimpleBroker(),
+    brokerEngine: new AGSimpleBroker(),
     wsEngine: 'ws',
     wsEngineServerOptions: {},
     maxPayload: null,
