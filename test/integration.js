@@ -151,10 +151,10 @@ describe('Integration tests', function () {
       };
 
       server = asyngularServer.listen(PORT_NUMBER, serverOptions);
-
-      server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, async (middlewareSocketStream) => {
-        for await (let action of middlewareSocketStream) {
-          if (action.type === server.ACTION_AUTHENTICATE && action.authToken.username === 'alice') {
+      server.setMiddleware(server.MIDDLEWARE_INBOUND, async (middlewareStream) => {
+        for await (let action of middlewareStream) {
+          console.log('TODO 2 MIDDLEWARE ACTION for-await-of **************', action.type); // -------------
+          if (action.type === server.ACTION_AUTHENTICATE && action.authToken.username === 'alice') { // TODO 2: WHat do to about properties of action object??
             let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
             err.name = 'AuthenticateMiddlewareError';
             action.block(err);
@@ -324,14 +324,11 @@ describe('Integration tests', function () {
     });
 
     it('Should not authenticate the client if MIDDLEWARE_AUTHENTICATE blocks the authentication', async function () {
-      // TODO 2 TODO 3 TODO 4 Maybe MIDDLEWARE_AUTHENTICATE should be on server because it's hard to catch it otherwise !!!!!
-      // because the action happens before the 'connection' event triggers on the server side; doesn't give enough time to attach middlewares.
       global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenAlice);
 
       client = asyngularClient.create(clientOptions);
       // The previous test authenticated us as 'alice', so that token will be passed to the server as
       // part of the handshake.
-
       let event = await client.listener('connect').once();
       // Any token containing the username 'alice' should be blocked by the MIDDLEWARE_AUTHENTICATE middleware.
       // This will only affects token-based authentication, not the credentials-based login event.
@@ -1303,22 +1300,21 @@ describe('Integration tests', function () {
 
       // Each subscription should pass through the middleware individually, even
       // though they were sent as a batch/array.
-      server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, async function (middlewareSocketStream) {
-        for await (let action of middlewareSocketStream) {
-          console.log('TODO 2 &&&&&&', action);
-          // if (action.type === server.ACTION_SUBSCRIBE) {
-          //   subscribeMiddlewareCounter++;
-          //   assert.equal(action.channel.indexOf('my-channel-'), 0);
-          //   if (action.channel === 'my-channel-10') {
-          //     assert.equal(JSON.stringify(action.data), JSON.stringify({foo: 123}));
-          //   } else if (action.channel === 'my-channel-12') {
-          //     // Block my-channel-12
-          //     let err = new Error('You cannot subscribe to channel 12');
-          //     err.name = 'UnauthorizedSubscribeError';
-          //     action.block(err);
-          //     continue;
-          //   }
-          // }
+      server.setMiddleware(server.MIDDLEWARE_INBOUND, async function (middlewareStream) {
+        for await (let action of middlewareStream) {
+          if (action.type === server.ACTION_SUBSCRIBE) {
+            subscribeMiddlewareCounter++;
+            assert.equal(action.channel.indexOf('my-channel-'), 0);
+            if (action.channel === 'my-channel-10') {
+              assert.equal(JSON.stringify(action.data), JSON.stringify({foo: 123}));
+            } else if (action.channel === 'my-channel-12') {
+              // Block my-channel-12
+              let err = new Error('You cannot subscribe to channel 12');
+              err.name = 'UnauthorizedSubscribeError';
+              action.block(err);
+              continue;
+            }
+          }
           action.allow();
         }
       });
@@ -2047,15 +2043,15 @@ describe('Integration tests', function () {
 
     describe('MIDDLEWARE_AUTHENTICATE', function () {
       it('Should not run authenticate middleware if JWT token does not exist', async function () {
-        middlewareFunction = async function (middlewareSocketStream) {
-          for await (let action of middlewareSocketStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_AUTHENTICATE) {
               middlewareWasExecuted = true;
             }
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2069,15 +2065,15 @@ describe('Integration tests', function () {
       it('Should run authenticate middleware if JWT token exists', async function () {
         global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenBob);
 
-        middlewareFunction = async function (middlewareSocketStream) {
-          for await (let action of middlewareSocketStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_AUTHENTICATE) {
               middlewareWasExecuted = true;
             }
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SOCKET_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2102,8 +2098,8 @@ describe('Integration tests', function () {
         let clientErrors = [];
         let abortStatus;
 
-        middlewareFunction = async function (middlewareServerStream) {
-          for await (let action of middlewareServerStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
@@ -2115,7 +2111,7 @@ describe('Integration tests', function () {
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         (async () => {
           for await (let {warning} of server.listener('warning')) {
@@ -2155,8 +2151,8 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (middlewareServerStream) {
-          for await (let action of middlewareServerStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
@@ -2168,7 +2164,7 @@ describe('Integration tests', function () {
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2192,8 +2188,8 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (middlewareServerStream) {
-          for await (let action of middlewareServerStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_HANDSHAKE_AG) {
               await wait(100);
               middlewareWasExecuted = true;
@@ -2209,7 +2205,7 @@ describe('Integration tests', function () {
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         client = asyngularClient.create({
           hostname: clientOptions.hostname,
@@ -2234,15 +2230,15 @@ describe('Integration tests', function () {
         let abortStatus;
         let abortReason;
 
-        middlewareFunction = async function (middlewareServerStream) {
-          for await (let action of middlewareServerStream) {
+        middlewareFunction = async function (middlewareStream) {
+          for await (let action of middlewareStream) {
             if (action.type === server.ACTION_HANDSHAKE_AG) {
               await wait(500);
             }
             action.allow();
           }
         };
-        server.setMiddleware(server.MIDDLEWARE_SERVER_INBOUND, middlewareFunction);
+        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
         createConnectionTime = Date.now();
         client = asyngularClient.create({

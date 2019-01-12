@@ -29,7 +29,12 @@ function AGServerSocket(id, server, socket) {
   this._receiverDemux = new StreamDemux();
   this._procedureDemux = new StreamDemux();
 
-  this.request = this.socket.upgradeReq || {};
+  this.request = this.socket.upgradeReq;
+
+  // TODO 2: Add MIDDLEWARE_INBOUND_RAW for applying middleware on raw messages.
+  this._middlewareInboundStream = this.request[this.server.SYMBOL_MIDDLEWARE_INBOUND_STREAM];
+  this._middlewareOutboundStream = new WritableAsyncIterableStream();
+  this._middlewareOutboundStream.type = this.server.MIDDLEWARE_OUTBOUND;
 
   if (this.request.connection) {
     this.remoteAddress = this.request.connection.remoteAddress;
@@ -50,10 +55,6 @@ function AGServerSocket(id, server, socket) {
 
   this.channelSubscriptions = {};
   this.channelSubscriptionsCount = 0;
-
-  // TODO 2: Add MIDDLEWARE_INBOUND_RAW for applying middleware on raw messages.
-  this._middlewareSocketInboundStream = new WritableAsyncIterableStream();
-  this._middlewareSocketInboundStream = new WritableAsyncIterableStream();
 
   this.socket.on('error', (err) => {
     this.emitError(err);
@@ -138,38 +139,6 @@ AGServerSocket.prototype._sendPing = function () {
   }
 };
 
-AGServerSocket.prototype._processMiddlewareAction = async function (middlewareStream, action) {
-  if (!this.server.hasMiddleware(action.type)) {
-    return action.data;
-  }
-  middlewareStream.write(action);
-
-  let newData;
-  try {
-    newData = await action.promise;
-  } catch (error) {
-    let clientError;
-    if (error.silent) {
-      clientError = new SilentMiddlewareBlockedError(
-        `Action was blocked by ${action.name} middleware`,
-        action.name
-      );
-    } else {
-      clientError = error;
-    }
-    if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
-      this.emitError(error);
-    }
-    throw clientError;
-  }
-
-  if (newData === undefined) {
-    newData = action.data;
-  }
-
-  return newData;
-};
-
 AGServerSocket.prototype._processInboundPacket = async function (packet, message) {
   if (packet && packet.event != null) {
     let eventName = packet.event;
@@ -229,7 +198,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     if (isRPC) {
       let request = new Request(this, packet.cid, packet.data);
       try {
-        newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
+        newData = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
       } catch (error) {
         request.error(error);
 
@@ -257,7 +226,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     }
 
     try {
-      newData = await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
+      newData = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
     } catch (error) {
 
       return;
@@ -286,7 +255,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 AGServerSocket.prototype._processOutboundPacket = async function (eventName, eventData) {
   let action = new Action(this.server.ACTION_PUBLISH_OUT, eventData);
 
-  this._middlewareSocketInboundStream.write(action);
+  this._middlewareOutboundStream.write(action);
 
   let newData = await action.promise;
   try {
@@ -761,12 +730,12 @@ AGServerSocket.prototype._processAuthToken = async function (signedAuthToken) {
   });
 
   try {
-    await this._processMiddlewareAction(this._middlewareSocketInboundStream, action);
+    await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
   } catch (error) {
     this.authToken = null;
     this.authState = this.UNAUTHENTICATED;
 
-    if (error.isBadToken) { // TODO 2: Check if isBadToken functionality is correct <-----------------
+    if (error.isBadToken) {
       this._emitBadAuthTokenError(error, signedAuthToken);
     }
     throw error;

@@ -43,7 +43,6 @@ function AGServer(options) {
   this.options = Object.assign(opts, options);
 
   this._middleware = {};
-  this._middlewareServerInboundStream = new WritableAsyncIterableStream();
 
   this.origins = opts.origins;
   this._allowAllOrigins = this.origins.indexOf('*:*') !== -1;
@@ -170,9 +169,11 @@ function AGServer(options) {
 
 AGServer.prototype = Object.create(AsyncStreamEmitter.prototype);
 
-AGServer.prototype.MIDDLEWARE_SERVER_INBOUND = AGServer.MIDDLEWARE_SERVER_INBOUND = 'serverInbound';
-AGServer.prototype.MIDDLEWARE_SOCKET_INBOUND = AGServer.MIDDLEWARE_SOCKET_INBOUND = 'socketInbound';
-AGServer.prototype.MIDDLEWARE_SOCKET_OUTBOUND = AGServer.MIDDLEWARE_SOCKET_OUTBOUND = 'socketOutbound';
+AGServer.prototype.SYMBOL_MIDDLEWARE_INBOUND_STREAM = AGServer.SYMBOL_MIDDLEWARE_INBOUND_STREAM = Symbol('inboundStream');
+AGServer.prototype.SYMBOL_MIDDLEWARE_OUTBOUND_STREAM = AGServer.SYMBOL_MIDDLEWARE_OUTBOUND_STREAM = Symbol('outboundStream');
+
+AGServer.prototype.MIDDLEWARE_INBOUND = AGServer.MIDDLEWARE_INBOUND = 'inbound';
+AGServer.prototype.MIDDLEWARE_OUTBOUND = AGServer.MIDDLEWARE_OUTBOUND = 'outbound';
 
 AGServer.prototype.ACTION_HANDSHAKE_WS = AGServer.ACTION_HANDSHAKE_WS = 'handshakeWS';
 AGServer.prototype.ACTION_HANDSHAKE_AG = AGServer.ACTION_HANDSHAKE_AG = 'handshakeAG';
@@ -303,14 +304,14 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
   this._handleSocketErrors(agSocket);
 
-  let socketInboundMiddleware = this._middleware[this.MIDDLEWARE_SOCKET_INBOUND];
+  let socketInboundMiddleware = this._middleware[this.MIDDLEWARE_INBOUND];
   if (socketInboundMiddleware) {
-    socketInboundMiddleware(agSocket._middlewareSocketInboundStream); // TODO 2: On disconnect, close all socket middleware streams
+    socketInboundMiddleware(agSocket._middlewareInboundStream); // TODO 2: On disconnect, close all socket middleware streams
   }
 
-  let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_SOCKET_OUTBOUND];
+  let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_OUTBOUND];
   if (socketOutboundMiddleware) {
-    socketOutboundMiddleware(agSocket._middlewareSocketOutboundStream); // TODO 2: On disconnect, close all socket middleware streams
+    socketOutboundMiddleware(agSocket._middlewareOutboundStream); // TODO 2: On disconnect, close all socket middleware streams
   }
 
   this.pendingClients[socketId] = agSocket;
@@ -326,12 +327,15 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
         if (error.isBadToken) {
           agSocket.deauthenticate();
           rpc.error(error);
+
           return;
         }
+
         rpc.end({
           isAuthenticated: !!agSocket.authToken,
-          authError: scErrors.dehydrateError(error)
+          authError: signedAuthToken == null ? null : scErrors.dehydrateError(error)
         });
+
         return;
       }
       agSocket.triggerAuthenticationEvents(oldAuthState);
@@ -370,13 +374,16 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
             let error = new BrokerError(`Failed to subscribe socket to the ${channelOptions.channel} channel - ${err}`);
             rpc.error(error);
             agSocket.emitError(error);
+
             return;
           }
           if (channelOptions.batch) {
             rpc.end(undefined, {batch: true});
+
             return;
           }
           rpc.end();
+
           return;
         }
         // This is an invalid state; it means the client tried to subscribe before
@@ -477,14 +484,14 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
       let signedAuthToken = data.authToken || null;
       clearTimeout(agSocket._handshakeTimeoutRef);
 
-      let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_SERVER_INBOUND];
+      let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_INBOUND];
       if (serverInboundMiddleware) {
-        serverInboundMiddleware(this._middlewareServerInboundStream);
+        serverInboundMiddleware(agSocket._middlewareInboundStream);
       }
       let action = new Action(this.ACTION_HANDSHAKE_AG, {socket: agSocket});
 
       try {
-        await this._processMiddlewareAction(this._middlewareServerInboundStream, action);
+        await this._processMiddlewareAction(agSocket._middlewareInboundStream, action);
       } catch (error) {
         if (error.statusCode == null) {
           error.statusCode = statusCode;
@@ -578,9 +585,8 @@ AGServer.prototype.generateId = function () {
 
 AGServer.prototype.setMiddleware = function (type, middleware) {
   if (
-    type !== this.MIDDLEWARE_SERVER_INBOUND &&
-    type !== this.MIDDLEWARE_SOCKET_INBOUND &&
-    type !== this.MIDDLEWARE_SOCKET_OUTBOUND
+    type !== this.MIDDLEWARE_INBOUND &&
+    type !== this.MIDDLEWARE_OUTBOUND
   ) {
     throw new InvalidArgumentsError(
       `Middleware type "${type}" is not supported`
@@ -592,7 +598,7 @@ AGServer.prototype.setMiddleware = function (type, middleware) {
   this._middleware[type] = middleware;
 };
 
-AGServer.prototype.removeMiddleware = function (type, middleware) {
+AGServer.prototype.removeMiddleware = function (type) {
   delete this._middleware[type];
 };
 
@@ -600,8 +606,8 @@ AGServer.prototype.hasMiddleware = function (type) {
   return !!this._middleware[type];
 };
 
-AGServer.prototype._processMiddlewareAction = async function (middlewareStream, action) {
-  if (!this.hasMiddleware(action.type)) {
+AGServer.prototype._processMiddlewareAction = async function (middlewareStream, action, socket) {
+  if (!this.hasMiddleware(middlewareStream.type)) {
     return action.data;
   }
   middlewareStream.write(action);
@@ -620,7 +626,11 @@ AGServer.prototype._processMiddlewareAction = async function (middlewareStream, 
       clientError = error;
     }
     if (this.server.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
-      this.emitWarning(error);
+      if (socket) {
+        socket.emitError(error);
+      } else {
+        this.emitWarning(error);
+      }
     }
     throw clientError;
   }
@@ -653,14 +663,18 @@ AGServer.prototype.verifyHandshake = async function (info, callback) {
   }
 
   if (ok) {
-    let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_SERVER_INBOUND];
+    let middlewareInboundStream = new WritableAsyncIterableStream();
+    middlewareInboundStream.type = this.MIDDLEWARE_INBOUND;
+    req[this.SYMBOL_MIDDLEWARE_INBOUND_STREAM] = middlewareInboundStream;
+
+    let serverInboundMiddleware = this._middleware[this.MIDDLEWARE_INBOUND];
     if (serverInboundMiddleware) {
-      serverInboundMiddleware(this._middlewareServerInboundStream);
+      serverInboundMiddleware(middlewareInboundStream);
     }
     let action = new Action(this.ACTION_HANDSHAKE_WS, {request: req});
 
     try {
-      await this._processMiddlewareAction(this._middlewareServerInboundStream, action);
+      await this._processMiddlewareAction(middlewareInboundStream, action);
     } catch (error) {
       callback(false, 401, typeof error === 'string' ? error : error.message);
       return;
