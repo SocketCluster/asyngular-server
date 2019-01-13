@@ -126,6 +126,17 @@ function connectionHandler(socket) {
 };
 
 describe('Integration tests', function () {
+  beforeEach('Prepare options', async function () {
+    clientOptions = {
+      hostname: '127.0.0.1',
+      port: PORT_NUMBER
+    };
+    serverOptions = {
+      authKey: 'testkey',
+      wsEngine: WS_ENGINE
+    };
+  });
+
   afterEach('Close server and client after each test', async function () {
     if (client) {
       client.closeAllListeners();
@@ -141,15 +152,6 @@ describe('Integration tests', function () {
 
   describe('Client authentication', function () {
     beforeEach('Run the server before start', async function () {
-      clientOptions = {
-        hostname: '127.0.0.1',
-        port: PORT_NUMBER
-      };
-      serverOptions = {
-        authKey: 'testkey',
-        wsEngine: WS_ENGINE
-      };
-
       server = asyngularServer.listen(PORT_NUMBER, serverOptions);
       server.setMiddleware(server.MIDDLEWARE_INBOUND, async (middlewareStream) => {
         for await (let action of middlewareStream) {
@@ -1356,7 +1358,6 @@ describe('Integration tests', function () {
 
       (async () => {
         for await (let event of channelList[19].listener('subscribe')) {
-          console.log('TODO 3333', 3333333, data); // -----------------------------------
           client.publish('my-channel-19', 'Hello!');
         }
       })();
@@ -1813,7 +1814,6 @@ describe('Integration tests', function () {
     });
 
     it('Socket channelSubscriptions and channelSubscriptionsCount should update when socket.kickOut(channel) is called', async function () {
-
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -1855,56 +1855,6 @@ describe('Integration tests', function () {
       client.subscribe('foo');
 
       await wait(100);
-      assert.equal(errorList.length, 0);
-      assert.equal(wasKickOutCalled, true);
-      assert.equal(serverSocket.channelSubscriptionsCount, 0);
-      assert.equal(Object.keys(serverSocket.channelSubscriptions).length, 0);
-    });
-
-    it('Socket channelSubscriptions and channelSubscriptionsCount should update when socket.kickOut() is called without arguments', async function () {
-
-      server = asyngularServer.listen(PORT_NUMBER, {
-        authKey: serverOptions.authKey,
-        wsEngine: WS_ENGINE
-      });
-
-      let errorList = [];
-      let serverSocket;
-      let wasKickOutCalled = false;
-
-      (async () => {
-        for await (let {socket} of server.listener('connection')) {
-          serverSocket = socket;
-
-          (async () => {
-            for await (let {error} of socket.listener('error')) {
-              errorList.push(error);
-            }
-          })();
-
-          (async () => {
-            for await (let event of socket.listener('subscribe')) {
-              if (socket.channelSubscriptionsCount === 2) {
-                await wait(50);
-                wasKickOutCalled = true;
-                socket.kickOut();
-              }
-            }
-          })();
-        }
-      })();
-
-      await server.listener('ready').once();
-
-      client = asyngularClient.create({
-        hostname: clientOptions.hostname,
-        port: PORT_NUMBER
-      });
-
-      client.subscribe('foo');
-      client.subscribe('bar');
-
-      await wait(200);
       assert.equal(errorList.length, 0);
       assert.equal(wasKickOutCalled, true);
       assert.equal(serverSocket.channelSubscriptionsCount, 0);

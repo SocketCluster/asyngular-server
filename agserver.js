@@ -18,6 +18,8 @@ const InvalidActionError = scErrors.InvalidActionError;
 const BrokerError = scErrors.BrokerError;
 const ServerProtocolError = scErrors.ServerProtocolError;
 
+const HANDSHAKE_REJECTION_STATUS_CODE = 4008;
+
 function AGServer(options) {
   AsyncStreamEmitter.call(this);
 
@@ -37,7 +39,7 @@ function AGServer(options) {
     path: '/socketcluster/',
     authDefaultExpiry: 86400,
     pubSubBatchDuration: null,
-    middlewareEmitWarnings: true
+    middlewareEmitFailures: true
   };
 
   this.options = Object.assign(opts, options);
@@ -59,7 +61,7 @@ function AGServer(options) {
 
   this.brokerEngine = opts.brokerEngine;
   this.appName = opts.appName || '';
-  this.middlewareEmitWarnings = opts.middlewareEmitWarnings;
+  this.middlewareEmitFailures = opts.middlewareEmitFailures;
 
   // Make sure there is always a leading and a trailing slash in the WS path.
   this._path = opts.path.replace(/\/?$/, '/').replace(/^\/?/, '/');
@@ -304,7 +306,7 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
   let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_OUTBOUND];
   if (socketOutboundMiddleware) {
-    socketOutboundMiddleware(agSocket._middlewareOutboundStream); // TODO 2: On disconnect, close all socket middleware streams
+    socketOutboundMiddleware(agSocket._middlewareOutboundStream);
   }
 
   this.pendingClients[socketId] = agSocket;
@@ -415,6 +417,8 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
     agSocket.closeListener('authenticate');
     agSocket.closeListener('authStateChange');
     agSocket.closeListener('deauthenticate');
+    agSocket._middlewareOutboundStream.close();
+    agSocket._middlewareInboundStream.close();
 
     let isClientFullyConnected = !!this.clients[socketId];
 
@@ -479,7 +483,7 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
         await this._processMiddlewareAction(agSocket._middlewareInboundStream, action);
       } catch (error) {
         if (error.statusCode == null) {
-          error.statusCode = statusCode;
+          error.statusCode = HANDSHAKE_REJECTION_STATUS_CODE;
         }
         rpc.error(error);
         agSocket.disconnect(error.statusCode);
@@ -610,7 +614,7 @@ AGServer.prototype._processMiddlewareAction = async function (middlewareStream, 
     } else {
       clientError = error;
     }
-    if (this.middlewareEmitWarnings) { // TODO 2: Rename middlewareEmitWarnings to middlewareEmitFailures
+    if (this.middlewareEmitFailures) {
       if (socket) {
         socket.emitError(error);
       } else {

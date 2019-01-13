@@ -225,13 +225,25 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
         return;
       }
 
-      if (!isPublish && !isSubscribe) {
+      if (isPublish || isSubscribe) {
+        request.data = request.data || {};
+        request.data.data = newData;
+      } else {
         request.data = newData;
       }
-
       if (isPublish) {
+        let publishPacket = request.data || {};
+
+        if (typeof publishPacket.channel !== 'string') {
+          let error = new InvalidActionError(`Socket ${this.id} tried to publish to an invalid "${publishPacket.channel}" channel`);
+          this.emitError(error);
+          request.error(error);
+
+          return;
+        }
+
         try {
-          await this.server.exchange.publish(request.channel, request.data); // TODO 2 TODO 3
+          await this.server.exchange.publish(publishPacket.channel, publishPacket.data);
         } catch (error) {
           this.emitError(error);
           request.error(error);
@@ -420,7 +432,8 @@ AGServerSocket.prototype.sendObject = function (object, options) {
 AGServerSocket.prototype.transmit = async function (event, data, options) {
   let newData;
   let packet = {event, data};
-  if (event === '#publish') {
+  let isPublish = event === '#publish';
+  if (isPublish) {
     let action = new Action();
     action.type = this.server.ACTION_PUBLISH_OUT;
     action.socket = this;
@@ -439,16 +452,21 @@ AGServerSocket.prototype.transmit = async function (event, data, options) {
     newData = packet.data;
   }
 
+  // TODO 2: Use optimization???? ag-simple-broker
   if (options && options.useCache && options.stringifiedData != null) {
     // Optimized
     this.send(options.stringifiedData);
   } else {
     let eventObject = {
-      event: event
+      event
     };
-    if (newData !== undefined) {
+    if (isPublish) {
+      eventObject.data = data || {};
+      eventObject.data.data = newData;
+    } else {
       eventObject.data = newData;
     }
+
     this.sendObject(eventObject);
   }
 };
@@ -629,17 +647,9 @@ AGServerSocket.prototype.deauthenticate = function () {
 };
 
 AGServerSocket.prototype.kickOut = function (channel, message) {
-  if (channel == null) {
-    Object.keys(this.channelSubscriptions).forEach((channelName) => {
-      delete this.channelSubscriptions[channelName];
-      this.channelSubscriptionsCount--;
-      this.transmit('#kickOut', {message: message, channel: channelName});
-    });
-  } else {
-    delete this.channelSubscriptions[channel];
-    this.channelSubscriptionsCount--;
-    this.transmit('#kickOut', {message: message, channel: channel});
-  }
+  delete this.channelSubscriptions[channel];
+  this.channelSubscriptionsCount--;
+  this.transmit('#kickOut', {channel, message});
   return this.server.brokerEngine.unsubscribeSocket(this, channel);
 };
 
