@@ -1,9 +1,10 @@
 const scErrors = require('sc-errors');
 const InvalidActionError = scErrors.InvalidActionError;
 
-function Request(socket, id, data) {
+function Request(socket, id, procedureName, data) {
   this.socket = socket;
   this.id = id;
+  this.procedure = procedureName;
   this.data = data;
   this.sent = false;
 

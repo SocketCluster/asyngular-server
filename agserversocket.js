@@ -146,7 +146,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
 
     if (eventName === '#handshake' || eventName === '#authenticate') {
       // Let AGServer handle these events.
-      let request = new Request(this, packet.cid, packet.data);
+      let request = new Request(this, packet.cid, eventName, packet.data);
       this._procedureDemux.write(eventName, request);
 
       return;
@@ -171,7 +171,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
         this.emitError(error);
 
         if (isRPC) {
-          let request = new Request(this, packet.cid, packet.data);
+          let request = new Request(this, packet.cid, eventName, packet.data);
           request.error(error);
         }
         return;
@@ -189,7 +189,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
       }
     } else if (eventName === '#unsubscribe') {
       // Let AGServer handle this event.
-      let request = new Request(this, packet.cid, packet.data);
+      let request = new Request(this, packet.cid, eventName, packet.data);
       this._procedureDemux.write(eventName, request);
 
       return;
@@ -216,7 +216,7 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     }
 
     if (isRPC) {
-      let request = new Request(this, packet.cid, packet.data);
+      let request = new Request(this, packet.cid, eventName, packet.data);
       try {
         let {data} = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
         newData = data;
