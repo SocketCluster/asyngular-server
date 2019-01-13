@@ -180,7 +180,7 @@ describe('Integration tests', function () {
             action.type === server.ACTION_AUTHENTICATE &&
             (!action.authToken || action.authToken.username === 'alice')
           ) {
-            let err = new Error('Blocked by MIDDLEWARE_AUTHENTICATE');
+            let err = new Error('Blocked by MIDDLEWARE_INBOUND');
             err.name = 'AuthenticateMiddlewareError';
             action.block(err);
             continue;
@@ -348,14 +348,14 @@ describe('Integration tests', function () {
       assert.equal(authenticationStateChangeEvents[1].authToken, null);
     });
 
-    it('Should not authenticate the client if MIDDLEWARE_AUTHENTICATE blocks the authentication', async function () {
+    it('Should not authenticate the client if MIDDLEWARE_INBOUND blocks the authentication', async function () {
       global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenAlice);
 
       client = asyngularClient.create(clientOptions);
       // The previous test authenticated us as 'alice', so that token will be passed to the server as
       // part of the handshake.
       let event = await client.listener('connect').once();
-      // Any token containing the username 'alice' should be blocked by the MIDDLEWARE_AUTHENTICATE middleware.
+      // Any token containing the username 'alice' should be blocked by the MIDDLEWARE_INBOUND middleware.
       // This will only affects token-based authentication, not the credentials-based login event.
       assert.equal(event.isAuthenticated, false);
       assert.notEqual(event.authError, null);
@@ -364,7 +364,7 @@ describe('Integration tests', function () {
   });
 
   describe('Server authentication', function () {
-    it('Token should be available after Promise resolves if token engine signing is synchronous', async function () {
+    it('Token should be available after the authenticate listener resolves', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -394,7 +394,7 @@ describe('Integration tests', function () {
       assert.equal(client.authToken.username, 'bob');
     });
 
-    it('If token engine signing is asynchronous, authentication can be captured using the authenticate event', async function () { // TODO asynchronous title no longer relevant
+    it('Authentication can be captured using the authenticate listener', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -424,7 +424,7 @@ describe('Integration tests', function () {
       assert.equal(client.authToken.username, 'bob');
     });
 
-    it('Should still work if token verification is asynchronous', async function () { // TODO 2: Title not relevant anymore
+    it('Previously authenticated client should still be authenticated after reconnecting', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
@@ -672,7 +672,7 @@ describe('Integration tests', function () {
       assert.equal(authTokenSignedEventEmitted, true);
     });
 
-    it('Should reject Promise returned by socket.setAuthToken if token delivery fails and rejectOnFailedDelivery option is true', async function () {
+    it('The socket.setAuthToken call should reject if token delivery fails and rejectOnFailedDelivery option is true', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE,
@@ -722,7 +722,7 @@ describe('Integration tests', function () {
       }
     });
 
-    it('Should not reject Promise returned by socket.setAuthToken if token delivery fails and rejectOnFailedDelivery option is not true', async function () {
+    it('The socket.setAuthToken call should not reject if token delivery fails and rejectOnFailedDelivery option is not true', async function () {
       server = asyngularServer.listen(PORT_NUMBER, {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE,
@@ -2055,220 +2055,222 @@ describe('Integration tests', function () {
       await server.listener('ready').once();
     });
 
-    describe('MIDDLEWARE_AUTHENTICATE', function () {
-      it('Should not run authenticate middleware if JWT token does not exist', async function () {
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow} of middlewareStream) {
-            if (type === server.ACTION_AUTHENTICATE) {
-              middlewareWasExecuted = true;
+    describe('MIDDLEWARE_INBOUND', function () {
+      describe('ACTION_AUTHENTICATE', function () {
+        it('Should not run ACTION_AUTHENTICATE middleware action if JWT token does not exist', async function () {
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow} of middlewareStream) {
+              if (type === server.ACTION_AUTHENTICATE) {
+                middlewareWasExecuted = true;
+              }
+              allow();
             }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
+
+          await client.listener('connect').once();
+          assert.notEqual(middlewareWasExecuted, true);
         });
 
-        await client.listener('connect').once();
-        assert.notEqual(middlewareWasExecuted, true);
+        it('Should run ACTION_AUTHENTICATE middleware action if JWT token exists', async function () {
+          global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenBob);
+
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow} of middlewareStream) {
+              if (type === server.ACTION_AUTHENTICATE) {
+                middlewareWasExecuted = true;
+              }
+              allow();
+            }
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
+
+          (async () => {
+            try {
+              await client.invoke('login', {username: 'bob'});
+            } catch (err) {}
+          })();
+
+          await client.listener('authenticate').once();
+          assert.equal(middlewareWasExecuted, true);
+        });
       });
 
-      it('Should run authenticate middleware if JWT token exists', async function () {
-        global.localStorage.setItem('asyngular.authToken', validSignedAuthTokenBob);
+      describe('ACTION_HANDSHAKE_AG', function () {
+        it('Should trigger correct events if MIDDLEWARE_HANDSHAKE_AG blocks with an error', async function () {
+          let middlewareWasExecuted = false;
+          let serverWarnings = [];
+          let clientErrors = [];
+          let abortStatus;
 
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow} of middlewareStream) {
-            if (type === server.ACTION_AUTHENTICATE) {
-              middlewareWasExecuted = true;
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow, block} of middlewareStream) {
+              if (type === server.ACTION_HANDSHAKE_AG) {
+                await wait(100);
+                middlewareWasExecuted = true;
+                let err = new Error('AG handshake failed because the server was too lazy');
+                err.name = 'TooLazyHandshakeError';
+                block(err);
+                continue;
+              }
+              allow();
             }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
+          (async () => {
+            for await (let {warning} of server.listener('warning')) {
+              serverWarnings.push(warning);
+            }
+          })();
+
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
+
+          (async () => {
+            for await (let {error} of client.listener('error')) {
+              clientErrors.push(error);
+            }
+          })();
+
+          (async () => {
+            let event = await client.listener('connectAbort').once();
+            abortStatus = event.code;
+          })();
+
+          await wait(200);
+          assert.equal(middlewareWasExecuted, true);
+          assert.notEqual(clientErrors[0], null);
+          assert.equal(clientErrors[0].name, 'TooLazyHandshakeError');
+          assert.notEqual(clientErrors[1], null);
+          assert.equal(clientErrors[1].name, 'SocketProtocolError');
+          assert.notEqual(serverWarnings[0], null);
+          assert.equal(serverWarnings[0].name, 'TooLazyHandshakeError');
+          assert.notEqual(abortStatus, null);
         });
 
-        (async () => {
-          try {
-            await client.invoke('login', {username: 'bob'});
-          } catch (err) {}
-        })();
+        it('Should send back default 4008 status code if MIDDLEWARE_HANDSHAKE_AG blocks without providing a status code', async function () {
+          let middlewareWasExecuted = false;
+          let abortStatus;
+          let abortReason;
 
-        await client.listener('authenticate').once();
-        assert.equal(middlewareWasExecuted, true);
-      });
-    });
-
-    describe('MIDDLEWARE_HANDSHAKE_AG', function () { // TODO 2: Rename to ACTION_
-      it('Should trigger correct events if MIDDLEWARE_HANDSHAKE_AG blocks with an error', async function () {
-        let middlewareWasExecuted = false;
-        let serverWarnings = [];
-        let clientErrors = [];
-        let abortStatus;
-
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow, block} of middlewareStream) {
-            if (type === server.ACTION_HANDSHAKE_AG) {
-              await wait(100);
-              middlewareWasExecuted = true;
-              let err = new Error('AG handshake failed because the server was too lazy');
-              err.name = 'TooLazyHandshakeError';
-              block(err);
-              continue;
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow, block} of middlewareStream) {
+              if (type === server.ACTION_HANDSHAKE_AG) {
+                await wait(100);
+                middlewareWasExecuted = true;
+                let err = new Error('AG handshake failed because the server was too lazy');
+                err.name = 'TooLazyHandshakeError';
+                block(err);
+                continue;
+              }
+              allow();
             }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
-        (async () => {
-          for await (let {warning} of server.listener('warning')) {
-            serverWarnings.push(warning);
-          }
-        })();
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
 
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
+          (async () => {
+            let event = await client.listener('connectAbort').once();
+            abortStatus = event.code;
+            abortReason = event.reason;
+          })();
+
+          await wait(200);
+          assert.equal(middlewareWasExecuted, true);
+          assert.equal(abortStatus, 4008);
+          assert.equal(abortReason, 'TooLazyHandshakeError: AG handshake failed because the server was too lazy');
         });
 
-        (async () => {
-          for await (let {error} of client.listener('error')) {
-            clientErrors.push(error);
-          }
-        })();
+        it('Should send back custom status code if MIDDLEWARE_HANDSHAKE_AG blocks by providing a status code', async function () {
+          let middlewareWasExecuted = false;
+          let abortStatus;
+          let abortReason;
 
-        (async () => {
-          let event = await client.listener('connectAbort').once();
-          abortStatus = event.code;
-        })();
-
-        await wait(200);
-        assert.equal(middlewareWasExecuted, true);
-        assert.notEqual(clientErrors[0], null);
-        assert.equal(clientErrors[0].name, 'TooLazyHandshakeError');
-        assert.notEqual(clientErrors[1], null);
-        assert.equal(clientErrors[1].name, 'SocketProtocolError');
-        assert.notEqual(serverWarnings[0], null);
-        assert.equal(serverWarnings[0].name, 'TooLazyHandshakeError');
-        assert.notEqual(abortStatus, null);
-      });
-
-      it('Should send back default 4008 status code if MIDDLEWARE_HANDSHAKE_AG blocks without providing a status code', async function () {
-        let middlewareWasExecuted = false;
-        let abortStatus;
-        let abortReason;
-
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow, block} of middlewareStream) {
-            if (type === server.ACTION_HANDSHAKE_AG) {
-              await wait(100);
-              middlewareWasExecuted = true;
-              let err = new Error('AG handshake failed because the server was too lazy');
-              err.name = 'TooLazyHandshakeError';
-              block(err);
-              continue;
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow, block} of middlewareStream) {
+              if (type === server.ACTION_HANDSHAKE_AG) {
+                await wait(100);
+                middlewareWasExecuted = true;
+                let err = new Error('AG handshake failed because of invalid query auth parameters');
+                err.name = 'InvalidAuthQueryHandshakeError';
+                // Set custom 4501 status code as a property of the error.
+                // We will treat this code as a fatal authentication failure on the front end.
+                // A status code of 4500 or higher means that the client shouldn't try to reconnect.
+                err.statusCode = 4501;
+                block(err);
+                continue;
+              }
+              allow();
             }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
+
+          (async () => {
+            let event = await client.listener('connectAbort').once();
+            abortStatus = event.code;
+            abortReason = event.reason;
+          })();
+
+          await wait(200);
+          assert.equal(middlewareWasExecuted, true);
+          assert.equal(abortStatus, 4501);
+          assert.equal(abortReason, 'InvalidAuthQueryHandshakeError: AG handshake failed because of invalid query auth parameters');
         });
 
-        (async () => {
-          let event = await client.listener('connectAbort').once();
-          abortStatus = event.code;
-          abortReason = event.reason;
-        })();
+        it('Should connect with a delay if next() is called after a timeout inside the middleware function', async function () {
+          let createConnectionTime = null;
+          let connectEventTime = null;
+          let abortStatus;
+          let abortReason;
 
-        await wait(200);
-        assert.equal(middlewareWasExecuted, true);
-        assert.equal(abortStatus, 4008);
-        assert.equal(abortReason, 'TooLazyHandshakeError: AG handshake failed because the server was too lazy');
-      });
-
-      it('Should send back custom status code if MIDDLEWARE_HANDSHAKE_AG blocks by providing a status code', async function () {
-        let middlewareWasExecuted = false;
-        let abortStatus;
-        let abortReason;
-
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow, block} of middlewareStream) {
-            if (type === server.ACTION_HANDSHAKE_AG) {
-              await wait(100);
-              middlewareWasExecuted = true;
-              let err = new Error('AG handshake failed because of invalid query auth parameters');
-              err.name = 'InvalidAuthQueryHandshakeError';
-              // Set custom 4501 status code as a property of the error.
-              // We will treat this code as a fatal authentication failure on the front end.
-              // A status code of 4500 or higher means that the client shouldn't try to reconnect.
-              err.statusCode = 4501;
-              block(err);
-              continue;
+          middlewareFunction = async function (middlewareStream) {
+            for await (let {type, allow} of middlewareStream) {
+              if (type === server.ACTION_HANDSHAKE_AG) {
+                await wait(500);
+              }
+              allow();
             }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
+          };
+          server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
 
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
+          createConnectionTime = Date.now();
+          client = asyngularClient.create({
+            hostname: clientOptions.hostname,
+            port: PORT_NUMBER
+          });
+
+          (async () => {
+            let event = await client.listener('connectAbort').once();
+            abortStatus = event.code;
+            abortReason = event.reason;
+          })();
+
+          await client.listener('connect').once();
+          connectEventTime = Date.now();
+          assert.equal(connectEventTime - createConnectionTime > 400, true);
         });
-
-        (async () => {
-          let event = await client.listener('connectAbort').once();
-          abortStatus = event.code;
-          abortReason = event.reason;
-        })();
-
-        await wait(200);
-        assert.equal(middlewareWasExecuted, true);
-        assert.equal(abortStatus, 4501);
-        assert.equal(abortReason, 'InvalidAuthQueryHandshakeError: AG handshake failed because of invalid query auth parameters');
-      });
-
-      it('Should connect with a delay if next() is called after a timeout inside the middleware function', async function () {
-        let createConnectionTime = null;
-        let connectEventTime = null;
-        let abortStatus;
-        let abortReason;
-
-        middlewareFunction = async function (middlewareStream) {
-          for await (let {type, allow} of middlewareStream) {
-            if (type === server.ACTION_HANDSHAKE_AG) {
-              await wait(500);
-            }
-            allow();
-          }
-        };
-        server.setMiddleware(server.MIDDLEWARE_INBOUND, middlewareFunction);
-
-        createConnectionTime = Date.now();
-        client = asyngularClient.create({
-          hostname: clientOptions.hostname,
-          port: PORT_NUMBER
-        });
-
-        (async () => {
-          let event = await client.listener('connectAbort').once();
-          abortStatus = event.code;
-          abortReason = event.reason;
-        })();
-
-        await client.listener('connect').once();
-        connectEventTime = Date.now();
-        assert.equal(connectEventTime - createConnectionTime > 400, true);
       });
     });
   });
