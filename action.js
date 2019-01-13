@@ -8,12 +8,12 @@ function Action() {
     this._reject = reject;
   });
 
-  this.allow = (data) => {
+  this.allow = (packet) => {
     if (this.outcome) {
       throw new InvalidActionError(`Action ${this.type} has already been ${this.outcome}; cannot allow`);
     }
     this.outcome = 'allowed';
-    this._resolve(data);
+    this._resolve(packet);
   };
 
   this.block = (error) => {

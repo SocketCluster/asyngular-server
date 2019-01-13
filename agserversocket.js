@@ -218,7 +218,8 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     if (isRPC) {
       let request = new Request(this, packet.cid, packet.data);
       try {
-        newData = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
+        let {data} = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
+        newData = data;
       } catch (error) {
         request.error(error);
 
@@ -261,7 +262,8 @@ AGServerSocket.prototype._processInboundPacket = async function (packet, message
     }
 
     try {
-      newData = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
+      let {data} = await this.server._processMiddlewareAction(this._middlewareInboundStream, action, this);
+      newData = data;
     } catch (error) {
 
       return;
@@ -312,6 +314,7 @@ AGServerSocket.prototype.getBytesReceived = function () {
 
 AGServerSocket.prototype.emitError = function (error) {
   this.emit('error', {error});
+  this.server.emitWarning(error);
 };
 
 AGServerSocket.prototype._onClose = function (code, reason) {
@@ -431,6 +434,7 @@ AGServerSocket.prototype.sendObject = function (object, options) {
 
 AGServerSocket.prototype.transmit = async function (event, data, options) {
   let newData;
+  let useCache = options ? options.useCache : false;
   let packet = {event, data};
   let isPublish = event === '#publish';
   if (isPublish) {
@@ -442,8 +446,12 @@ AGServerSocket.prototype.transmit = async function (event, data, options) {
       action.channel = data.channel;
       action.data = data.data;
     }
+    useCache = !this.server.hasMiddleware(this._middlewareOutboundStream.type);
+
     try {
-      newData = await this.server._processMiddlewareAction(this._middlewareOutboundStream, action, this);
+      let {data, options} = await this.server._processMiddlewareAction(this._middlewareOutboundStream, action, this);
+      newData = data;
+      useCache = options == null ? useCache : options.useCache;
     } catch (error) {
 
       return;
@@ -452,8 +460,7 @@ AGServerSocket.prototype.transmit = async function (event, data, options) {
     newData = packet.data;
   }
 
-  // TODO 2: Use optimization???? ag-simple-broker
-  if (options && options.useCache && options.stringifiedData != null) {
+  if (options && useCache && options.stringifiedData != null) {
     // Optimized
     this.send(options.stringifiedData);
   } else {

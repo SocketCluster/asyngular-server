@@ -66,6 +66,12 @@ function AGServer(options) {
   // Make sure there is always a leading and a trailing slash in the WS path.
   this._path = opts.path.replace(/\/?$/, '/').replace(/^\/?/, '/');
 
+  (async () => {
+    for await (let {error} of this.brokerEngine.listener('error')) {
+      this.emitWarning(error);
+    }
+  })();
+
   if (this.brokerEngine.isReady) {
     this.isReady = true;
     this.emit('ready', {});
@@ -134,14 +140,14 @@ function AGServer(options) {
     // Default codec engine
     this.codec = formatter;
   }
+  this.brokerEngine.setCodecEngine(this.codec);
+  this.exchange = this.brokerEngine.exchange();
 
   this.clients = {};
   this.clientsCount = 0;
 
   this.pendingClients = {};
   this.pendingClientsCount = 0;
-
-  this.exchange = this.brokerEngine.exchange();
 
   let wsServerOptions = opts.wsEngineServerOptions || {};
   wsServerOptions.server = this.httpServer;
@@ -193,6 +199,7 @@ AGServer.prototype.setAuthEngine = function (authEngine) {
 
 AGServer.prototype.setCodecEngine = function (codecEngine) {
   this.codec = codecEngine;
+  this.brokerEngine.setCodecEngine(codecEngine);
 };
 
 AGServer.prototype.emitError = function (error) {
@@ -208,13 +215,6 @@ AGServer.prototype._handleServerError = function (error) {
     error = new ServerProtocolError(error);
   }
   this.emitError(error);
-};
-
-AGServer.prototype._handleSocketErrors = async function (socket) {
-  // A socket error will show up as a warning on the server.
-  for await (let event of socket.listener('error')) {
-    this.emitWarning(event.error);
-  }
 };
 
 AGServer.prototype._handleHandshakeTimeout = function (agSocket) {
@@ -301,8 +301,6 @@ AGServer.prototype._handleSocketConnection = function (wsSocket, upgradeReq) {
 
   let agSocket = new AGServerSocket(socketId, this, wsSocket);
   agSocket.exchange = this.exchange;
-
-  this._handleSocketErrors(agSocket);
 
   let socketOutboundMiddleware = this._middleware[this.MIDDLEWARE_OUTBOUND];
   if (socketOutboundMiddleware) {
@@ -597,13 +595,18 @@ AGServer.prototype.hasMiddleware = function (type) {
 
 AGServer.prototype._processMiddlewareAction = async function (middlewareStream, action, socket) {
   if (!this.hasMiddleware(middlewareStream.type)) {
-    return action.data;
+    return {data: action.data, options: null};
   }
   middlewareStream.write(action);
 
   let newData;
+  let options = null;
   try {
-    newData = await action.promise;
+    let result = await action.promise;
+    if (result) {
+      newData = result.data;
+      options = result.options;
+    }
   } catch (error) {
     let clientError;
     if (error.silent) {
@@ -628,7 +631,7 @@ AGServer.prototype._processMiddlewareAction = async function (middlewareStream, 
     newData = action.data;
   }
 
-  return newData;
+  return {data: newData, options};
 };
 
 AGServer.prototype.verifyHandshake = async function (info, callback) {

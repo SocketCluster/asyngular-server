@@ -7,7 +7,6 @@ const AGSimpleBroker = require('ag-simple-broker');
 // Add to the global scope like in browser.
 global.localStorage = localStorage;
 
-
 let clientOptions;
 let serverOptions;
 
@@ -17,8 +16,11 @@ let allowedUsers = {
 };
 
 const PORT_NUMBER = 8008;
-const TEN_DAYS_IN_SECONDS = 60 * 60 * 24 * 10;
 const WS_ENGINE = 'ws';
+const LOG_WARNINGS = false;
+const LOG_ERRORS = false;
+
+const TEN_DAYS_IN_SECONDS = 60 * 60 * 24 * 10;
 
 let validSignedAuthTokenBob = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImJvYiIsImV4cCI6MzE2Mzc1ODk3OTA4MDMxMCwiaWF0IjoxNTAyNzQ3NzQ2fQ.dSZOfsImq4AvCu-Or3Fcmo7JNv1hrV3WqxaiSKkTtAo';
 let validSignedAuthTokenAlice = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFsaWNlIiwiaWF0IjoxNTE4NzI4MjU5LCJleHAiOjMxNjM3NTg5NzkwODAzMTB9.XxbzPPnnXrJfZrS0FJwb_EAhIu2VY5i7rGyUThtNLh4';
@@ -125,6 +127,23 @@ function connectionHandler(socket) {
   })();
 };
 
+function bindFailureHandlers(server) {
+  if (LOG_ERRORS) {
+    (async () => {
+      for await (let {error} of server.listener('error')) {
+        console.error('ERROR', error);
+      }
+    })();
+  }
+  if (LOG_WARNINGS) {
+    (async () => {
+      for await (let {warning} of server.listener('warning')) {
+        console.warn('WARNING', warning);
+      }
+    })();
+  }
+}
+
 describe('Integration tests', function () {
   beforeEach('Prepare options', async function () {
     clientOptions = {
@@ -153,6 +172,8 @@ describe('Integration tests', function () {
   describe('Client authentication', function () {
     beforeEach('Run the server before start', async function () {
       server = asyngularServer.listen(PORT_NUMBER, serverOptions);
+      bindFailureHandlers(server);
+
       server.setMiddleware(server.MIDDLEWARE_INBOUND, async (middlewareStream) => {
         for await (let action of middlewareStream) {
           if (
@@ -348,6 +369,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -377,6 +399,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -406,6 +429,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -441,6 +465,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -472,6 +497,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -503,6 +529,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -534,6 +561,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       let warningMap = {};
 
       (async () => {
@@ -600,6 +629,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       let authTokenSignedEventEmitted = false;
 
@@ -648,6 +678,7 @@ describe('Integration tests', function () {
         wsEngine: WS_ENGINE,
         ackTimeout: 1000
       });
+      bindFailureHandlers(server);
 
       let socketErrors = [];
 
@@ -697,6 +728,7 @@ describe('Integration tests', function () {
         wsEngine: WS_ENGINE,
         ackTimeout: 1000
       });
+      bindFailureHandlers(server);
 
       let socketErrors = [];
 
@@ -746,6 +778,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -781,6 +814,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
           return resolveAfterTimeout(500, {});
@@ -827,6 +862,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -852,6 +888,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       let connectionEmitted = false;
       let connectionEvent;
@@ -936,6 +973,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
           return resolveAfterTimeout(500, {});
@@ -1012,6 +1051,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
           return resolveAfterTimeout(10, {});
@@ -1089,6 +1130,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
           return resolveAfterTimeout(500, {});
@@ -1149,6 +1192,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
           return resolveAfterTimeout(0, {});
@@ -1211,6 +1256,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -1253,6 +1299,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         await wait(10);
@@ -1281,6 +1328,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -1374,6 +1422,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       server.setAuthEngine({
         verifyToken: function (signedAuthToken, verificationKey, verificationOptions) {
@@ -1428,6 +1477,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -1531,6 +1581,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       let eventList = [];
 
@@ -1576,6 +1627,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       await server.listener('ready').once();
 
@@ -1624,6 +1676,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       await server.listener('ready').once();
 
@@ -1675,6 +1728,7 @@ describe('Integration tests', function () {
         wsEngine: WS_ENGINE,
         brokerEngine: customBrokerEngine
       });
+      bindFailureHandlers(server);
 
       let eventList = [];
 
@@ -1723,6 +1777,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       let errorList = [];
 
@@ -1769,6 +1824,7 @@ describe('Integration tests', function () {
         wsEngine: WS_ENGINE,
         brokerEngine: customBrokerEngine
       });
+      bindFailureHandlers(server);
 
       (async () => {
         for await (let {socket} of server.listener('connection')) {
@@ -1818,6 +1874,7 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
 
       let errorList = [];
       let serverSocket;
@@ -1873,6 +1930,7 @@ describe('Integration tests', function () {
           pingInterval: 2000,
           pingTimeout: 500
         });
+        bindFailureHandlers(server);
 
         await server.listener('ready').once();
       });
@@ -1914,11 +1972,11 @@ describe('Integration tests', function () {
         await wait(1000);
         assert.notEqual(clientError, null);
         assert.equal(clientError.name, 'SocketProtocolError');
-        assert.equal(clientDisconnectCode, 4000);
+        assert.equal(clientDisconnectCode === 4000 || clientDisconnectCode === 4001, true);
 
         assert.notEqual(serverWarning, null);
         assert.equal(serverWarning.name, 'SocketProtocolError');
-        assert.equal(serverDisconnectionCode, 4001);
+        assert.equal(clientDisconnectCode === 4000 || clientDisconnectCode === 4001, true);
       });
     });
 
@@ -1933,6 +1991,7 @@ describe('Integration tests', function () {
           pingTimeout: 500,
           pingTimeoutDisabled: true
         });
+        bindFailureHandlers(server);
 
         await server.listener('ready').once();
       });
@@ -1991,6 +2050,8 @@ describe('Integration tests', function () {
         authKey: serverOptions.authKey,
         wsEngine: WS_ENGINE
       });
+      bindFailureHandlers(server);
+
       await server.listener('ready').once();
     });
 
