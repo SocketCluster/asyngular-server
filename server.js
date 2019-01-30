@@ -34,7 +34,7 @@ function AGServer(options) {
     path: '/asyngular/',
     protocolVersion: 2,
     authDefaultExpiry: 86400,
-    pubSubBatchDuration: null,
+    batchInterval: 100,
     middlewareEmitFailures: true
   };
 

@@ -62,9 +62,13 @@ function AGServerSocket(id, server, socket, protocolVersion) {
     this.forwardedForAddress = this.request.forwardedForAddress;
   }
 
+  this.isBatching = false;
+
+  this._batchingIntervalId = null;
   this._cid = 1;
   this._callbackMap = {};
-  this._batchSendList = [];
+  this.isBufferingBatch = false;
+  this._batchBuffer = []; // TODO 2 implement batchResubscriptions: true on the server; for the responses.
 
   this.channelSubscriptions = {};
   this.channelSubscriptionsCount = 0;
@@ -377,11 +381,7 @@ AGServerSocket.prototype._processSubscribeRequest = async function (request) {
 
       return;
     }
-    if (subscriptionOptions.batch) {
-      request.end(undefined, {batch: true});
 
-      return;
-    }
     request.end();
 
     return;
@@ -792,30 +792,66 @@ AGServerSocket.prototype.encode = function (object) {
   return this.server.codec.encode(object);
 };
 
-AGServerSocket.prototype.sendObjectBatch = function (object) {
-  this._batchSendList.push(object);
-  if (this._batchTimeout) {
+AGServerSocket.prototype.startBatch = function () {
+  this.isBufferingBatch = true;
+  this._batchBuffer = [];
+};
+
+AGServerSocket.prototype.flushBatch = function () {
+  this.isBufferingBatch = false;
+  let serializedBatch = this.serializeObject(this._batchBuffer);
+  this._batchBuffer = [];
+  this.send(serializedBatch);
+};
+
+AGServerSocket.prototype.cancelBatch = function () {
+  this.isBufferingBatch = false;
+  this._batchBuffer = [];
+};
+
+AGServerSocket.prototype._startBatching = function () {
+  if (this._batchingIntervalId != null) {
+    return;
+  }
+  this._batchingIntervalId = setInterval(() => {
+    this.flushBatch();
+    this.startBatch();
+  }, this.options.batchInterval);
+};
+
+AGServerSocket.prototype.startBatching = function () {
+  this.isBatching = true;
+  this._startBatching();
+};
+
+AGServerSocket.prototype._stopBatching = function () {
+  clearInterval(this._batchingIntervalId);
+  this._batchingIntervalId = null;
+  this.flushBatch();
+};
+
+AGServerSocket.prototype.stopBatching = function () {
+  this.isBatching = false;
+  this._stopBatching();
+};
+
+AGServerSocket.prototype._cancelBatching = function () {
+  clearInterval(this._batchingIntervalId);
+  this._batchingIntervalId = null;
+  this.cancelBatch();
+};
+
+AGServerSocket.prototype.cancelBatching = function () {
+  this.isBatching = false;
+  this._cancelBatching();
+};
+
+AGServerSocket.prototype.sendObject = function (object) {
+  if (this.isBufferingBatch) {
+    this._batchBuffer.push(object);
     return;
   }
 
-  this._batchTimeout = setTimeout(() => {
-    delete this._batchTimeout;
-    if (this._batchSendList.length) {
-      let str;
-      try {
-        str = this.encode(this._batchSendList);
-      } catch (err) {
-        this.emitError(err);
-      }
-      if (str != null) {
-        this.send(str);
-      }
-      this._batchSendList = [];
-    }
-  }, this.server.options.pubSubBatchDuration || 0);
-};
-
-AGServerSocket.prototype.sendObjectSingle = function (object) {
   let str;
   try {
     str = this.encode(object);
@@ -824,15 +860,6 @@ AGServerSocket.prototype.sendObjectSingle = function (object) {
   }
   if (str != null) {
     this.send(str);
-  }
-};
-
-// TODO 2: Refactor batch functionality.
-AGServerSocket.prototype.sendObject = function (object, options) {
-  if (options && options.batch) {
-    this.sendObjectBatch(object);
-  } else {
-    this.sendObjectSingle(object);
   }
 };
 
