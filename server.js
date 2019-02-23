@@ -38,6 +38,7 @@ function AGServer(options) {
     batchOnHandshakeDuration: 400,
     batchInterval: 50,
     middlewareEmitFailures: true,
+    killSocketStreamsOnClose: true,
     cloneData: false
   };
 

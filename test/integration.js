@@ -1247,7 +1247,7 @@ describe('Integration tests', function () {
       });
 
       let serverSocketClosed = false;
-      let serverSocketDisconnected = false;
+      let serverDisconnection = false;
       let serverClosure = false;
 
       (async () => {
@@ -1261,7 +1261,7 @@ describe('Integration tests', function () {
 
       (async () => {
         for await (let event of server.listener('disconnection')) {
-          serverSocketDisconnected = true;
+          serverDisconnection = true;
         }
       })();
 
@@ -1277,7 +1277,7 @@ describe('Integration tests', function () {
 
       await wait(1000);
       assert.equal(serverSocketClosed, true);
-      assert.equal(serverSocketDisconnected, true);
+      assert.equal(serverDisconnection, true);
       assert.equal(serverClosure, true);
     });
 
@@ -1375,6 +1375,52 @@ describe('Integration tests', function () {
       // Any value less than 30 indicates that the 'disconnect' event was triggerred out-of-band.
       // Since the client disconnect() call is executed on the 11th message, we can assume that the 'disconnect' event will trigger sooner.
       assert.equal(requestDataAtTimeOfDisconnect < 15, true);
+    });
+
+    it('Socket streams should be killed immediately if socket disconnects', async function () {
+      server = asyngularServer.listen(PORT_NUMBER, {
+        authKey: serverOptions.authKey,
+        wsEngine: WS_ENGINE
+      });
+      bindFailureHandlers(server);
+
+      let handledPackets = [];
+
+      (async () => {
+        let {socket} = await server.listener('closure').once();
+        socket.killAllReceivers(); // TODO 2
+      })();
+
+      (async () => {
+        for await (let {socket} of server.listener('connection')) {
+          (async () => {
+            for await (let packet of socket.receiver('foo')) {
+              await wait(30);
+              handledPackets.push(packet);
+            }
+          })();
+        }
+      })();
+
+      await server.listener('ready').once();
+
+      client = asyngularClient.create({
+        hostname: clientOptions.hostname,
+        port: PORT_NUMBER
+      });
+
+      await wait(100);
+
+      for (let i = 0; i < 100; i++) {
+        client.transmit('foo', i);
+      }
+
+      await wait(110);
+
+      client.disconnect(4445, 'Disconnect');
+
+      await wait(1000);
+      assert.equal(handledPackets.length, 4);
     });
   });
 
