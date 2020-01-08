@@ -1,4 +1,4 @@
-const cloneDeep = require('lodash.clonedeep');
+const cloneDeep = require('lodash').cloneDeep;
 const WritableConsumableStream = require('writable-consumable-stream');
 const StreamDemux = require('stream-demux');
 const AsyncStreamEmitter = require('async-stream-emitter');
@@ -1289,7 +1289,7 @@ AGServerSocket.prototype.setAuthToken = async function (data, options) {
     this.emitError(err);
     throw err;
   }
-  
+
   let authToken = cloneDeep(data);
   let oldAuthState = this.authState;
   this.authState = this.AUTHENTICATED;
